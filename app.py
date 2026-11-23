@@ -398,4 +398,160 @@ with tab_history:
             )
             grouped["漏刀率(%)"] = (grouped["漏打刀数"] / grouped["应出刀数"] * 100).round(1)
             grouped["刀均得星"] = grouped.apply(
-                lambda r: round(r["总得星"] / r["实际出刀"], 2) if r["实际出刀"] > 0 else 0
+                lambda r: round(r["总得星"] / r["实际出刀"], 2) if r["实际出刀"] > 0 else 0.0, axis=1
+            )
+            grouped["三星率(%)"] = grouped.apply(
+                lambda r: round(r["三星数"] / r["实际出刀"] * 100, 1) if r["实际出刀"] > 0 else 0.0, axis=1
+            )
+            grouped["出勤"] = grouped.apply(lambda r: f"{r['实际出刀']}/{r['应出刀数']}", axis=1)
+
+            def tag_hist_status(r):
+                if r["漏打刀数"] >= 6 or (r["漏打刀数"] > 0 and r["实际出刀"] == 0):
+                    return "🔴 严重"
+                elif r["漏打刀数"] > 0:
+                    return "🟡 漏打"
+                return "🟢 全勤"
+
+            grouped["状态"] = grouped.apply(tag_hist_status, axis=1)
+            grouped = grouped.sort_values(
+                by=["漏打刀数", "漏刀率(%)", "参战场次", "总得星"],
+                ascending=[False, False, False, False],
+            ).reset_index(drop=True)
+            grouped = grouped.rename(columns={"player_name": "成员名称", "player_tag": "玩家标签"})
+
+            render_kpi_grid([
+                ("统计场次", f"近 {len(target_war_ids)} 场", ""),
+                ("全勤人数", f"{int((grouped['漏打刀数'] == 0).sum())} 人", "ok"),
+                ("漏打人数", f"{int((grouped['漏打刀数'] > 0).sum())} 人", "alert"),
+                ("累计漏刀", f"{int(grouped['漏打刀数'].sum())} 刀", "alert"),
+            ])
+
+            view_hist = grouped[grouped["漏打刀数"] > 0] if only_miss_hist else grouped
+
+            compact_cols = ["状态", "成员名称", "出勤", "漏打刀数", "漏刀率(%)"]
+            detail_cols = [
+                "状态", "成员名称", "大本营", "参战场次", "出勤",
+                "漏打刀数", "漏刀率(%)", "总得星", "刀均得星", "三星率(%)"
+            ]
+            use_cols = detail_cols if show_full_cols else compact_cols
+
+            def style_hist(r):
+                s = str(r["状态"])
+                if "严重" in s:
+                    return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+                elif "漏打" in s:
+                    return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
+                return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
+
+            fmt_dict = {"漏刀率(%)": "{:.1f}%"}
+            if show_full_cols:
+                fmt_dict.update({"三星率(%)": "{:.1f}%", "刀均得星": "{:.2f}"})
+
+            st.dataframe(
+                view_hist[use_cols].style.apply(style_hist, axis=1).format(fmt_dict),
+                use_container_width=True,
+                height=480,
+                hide_index=True,
+            )
+
+            st.download_button(
+                label=f"⬇️ 下载最近{len(target_war_ids)}场出勤表 (.xlsx)",
+                data=build_excel_bytes(view_hist[detail_cols], f"最近{len(target_war_ids)}场统计"),
+                file_name=f"萌面打劫_最近{len(target_war_ids)}场出勤统计.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            sev = grouped[grouped["状态"].str.contains("严重")]
+            min_l = grouped[grouped["状态"].str.contains("漏打")]
+            msg = [
+                f"【萌面打劫 近{len(target_war_ids)}场部落战通报】",
+                f"全勤 {int((grouped['漏打刀数'] == 0).sum())} 人 | 漏打 {int((grouped['漏打刀数'] > 0).sum())} 人（共漏 {int(grouped['漏打刀数'].sum())} 刀）",
+                "",
+                "🔴 严重漏打 / 全鸽名单：",
+            ]
+            for _, r in sev.iterrows():
+                msg.append(f"- {r['成员名称']}：漏 {r['漏打刀数']} 刀（出勤 {r['出勤']}，漏刀率 {r['漏刀率(%)']}%）")
+            msg.append("")
+            msg.append("🟡 一般漏打提醒：")
+            for _, r in min_l.iterrows():
+                msg.append(f"- {r['成员名称']}：漏 {r['漏打刀数']} 刀（出勤 {r['出勤']}）")
+            st.markdown("**📢 一键复制群通知**")
+            st.code("\n".join(msg), language="text")
+
+with tab_clashperk:
+    gs_url = st.text_input("ClashPerk Google Sheet 链接", value=DEFAULT_SHEET_URL)
+    col_cp1, col_cp2 = st.columns(2)
+    with col_cp1:
+        cp_only_miss = st.checkbox("仅看漏打成员", value=False, key="cp_only_miss")
+    with col_cp2:
+        cp_full_cols = st.checkbox("展开详细星数列", value=False, key="cp_full_cols")
+
+    if gs_url:
+        try:
+            cp_raw = load_gsheet(gs_url).dropna(subset=["Name"]).copy()
+            cp_raw["Wars Participated"] = cp_raw["Wars Participated"].astype(int)
+            cp_raw["Number of Attacks"] = cp_raw["Number of Attacks"].astype(int)
+            cp_raw["Missed"] = cp_raw["Missed"].astype(int)
+            cp_raw["应出刀数"] = cp_raw["Wars Participated"] * 2
+            cp_raw["漏刀率(%)"] = (cp_raw["Missed"] / cp_raw["应出刀数"] * 100).round(1)
+            cp_raw["出勤"] = cp_raw.apply(lambda r: f"{r['Number of Attacks']}/{r['应出刀数']}", axis=1)
+            cp_raw["状态"] = cp_raw.apply(
+                lambda r: "🔴 严重"
+                if (r["Missed"] >= 6 or (r["Missed"] > 0 and r["Number of Attacks"] == 0))
+                else ("🟡 漏打" if r["Missed"] > 0 else "🟢 全勤"),
+                axis=1,
+            )
+            cp_sorted = cp_raw.sort_values(by=["Missed", "漏刀率(%)"], ascending=[False, False]).reset_index(drop=True)
+            cp_sorted = cp_sorted.rename(
+                columns={
+                    "Name": "成员名称",
+                    "Tag": "玩家标签",
+                    "Wars Participated": "参战场次",
+                    "Number of Attacks": "实际出刀",
+                    "Missed": "漏打刀数",
+                    "Total Stars": "总得星",
+                    "Avg. Stars": "刀均得星",
+                }
+            )
+
+            render_kpi_grid([
+                ("收录人数", f"{len(cp_sorted)} 人", ""),
+                ("全勤人数", f"{int((cp_sorted['漏打刀数'] == 0).sum())} 人", "ok"),
+                ("漏打人数", f"{int((cp_sorted['漏打刀数'] > 0).sum())} 人", "alert"),
+                ("累计漏刀", f"{int(cp_sorted['漏打刀数'].sum())} 刀", "alert"),
+            ])
+
+            cp_view = cp_sorted[cp_sorted["漏打刀数"] > 0] if cp_only_miss else cp_sorted
+            cp_compact = ["状态", "成员名称", "出勤", "漏打刀数", "漏刀率(%)"]
+            cp_detail = ["状态", "成员名称", "参战场次", "出勤", "漏打刀数", "漏刀率(%)", "总得星", "刀均得星"]
+            cp_cols = cp_detail if cp_full_cols else cp_compact
+
+            def style_cp(r):
+                s = str(r["状态"])
+                if "严重" in s:
+                    return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+                elif "漏打" in s:
+                    return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
+                return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
+
+            cp_fmt = {"漏刀率(%)": "{:.1f}%"}
+            if cp_full_cols:
+                cp_fmt["刀均得星"] = "{:.2f}"
+
+            st.dataframe(
+                cp_view[cp_cols].style.apply(style_cp, axis=1).format(cp_fmt),
+                use_container_width=True,
+                height=480,
+                hide_index=True,
+            )
+
+            st.download_button(
+                label="⬇️ 下载高亮统计表 (.xlsx)",
+                data=build_excel_bytes(cp_view[cp_detail], "ClashPerk统计"),
+                file_name="萌面打劫_部落战出勤统计.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"加载 Google Sheet 失败：{e}")
