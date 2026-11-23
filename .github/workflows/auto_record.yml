@@ -1,0 +1,38 @@
+name: Auto Record COC Clan War
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  record-war:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas requests
+
+      - name: Fetch and archive clan war
+        env:
+          COC_API_TOKEN: ${{ secrets.COC_API_TOKEN }}
+          COC_CLAN_TAG: "#2YR9JVCG8"
+        run: python fetch_war.py
+
+      - name: Commit updated war_history.csv
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add war_history.csv
+          git diff --staged --quiet || git commit -m "chore: update clan war history"
+          git push
