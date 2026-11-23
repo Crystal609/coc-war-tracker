@@ -1,22 +1,60 @@
 import io
+import os
 import re
+import urllib.parse
+from datetime import datetime, timezone
 import pandas as pd
+import requests
 import streamlit as st
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(
-    page_title="萌面打劫 | 部落战出勤与漏刀监控",
+    page_title="萌面打劫 | 部落战全自动出勤监控",
     page_icon="⚔️",
     layout="wide",
 )
 
+CLAN_TAG = "#2YR9JVCG8"
+API_BASE = "https://cocproxy.royaleapi.dev/v1"
+HISTORY_FILE = "war_history.csv"
 DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1GYL8qHNSyG8rGXycw_mbYIy-BuCpxlYPfYH7aYTvwPg/edit?gid=0#gid=0"
 
 
+def get_api_token() -> str:
+    try:
+        if "COC_API_TOKEN" in st.secrets:
+            return str(st.secrets["COC_API_TOKEN"]).strip()
+    except Exception:
+        pass
+    return os.getenv("COC_API_TOKEN", "").strip()
+
+
+def parse_coc_time(ts: str):
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=60)
+def fetch_live_war(clan_tag: str, token: str) -> dict:
+    encoded = urllib.parse.quote(clan_tag)
+    url = f"{API_BASE}/clans/{encoded}/currentwar"
+    resp = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"API 请求失败 ({resp.status_code}): {resp.text}")
+    return resp.json()
+
+
 def convert_gsheet_to_csv_url(url: str) -> str:
-    """将 Google Sheets 分享链接自动转换为 CSV 导出链接"""
     url = url.strip()
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not match:
@@ -28,75 +66,14 @@ def convert_gsheet_to_csv_url(url: str) -> str:
 
 
 @st.cache_data(ttl=120)
-def load_from_gsheet(url: str) -> pd.DataFrame:
-    csv_url = convert_gsheet_to_csv_url(url)
-    return pd.read_csv(csv_url)
+def load_gsheet(url: str) -> pd.DataFrame:
+    return pd.read_csv(convert_gsheet_to_csv_url(url))
 
 
-def process_war_data(raw_df: pd.DataFrame) -> pd.DataFrame:
-    df = raw_df.copy()
-    required_cols = [
-        "Name", "Tag", "Town Hall", "Wars Participated", "Number of Attacks",
-        "Total Stars", "Avg. Stars", "True Stars", "Avg. True Stars",
-        "Total Dest", "Avg. Dest", "Three Stars", "Two Stars", "One Stars",
-        "Zero Stars", "Missed"
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"表格缺少必要列：{', '.join(missing)}，请确认这是 ClashPerk 导出的 War Stats 表格。")
-
-    df = df.dropna(subset=["Name"]).copy()
-
-    num_cols = [
-        "Town Hall", "Wars Participated", "Number of Attacks",
-        "Total Stars", "Avg. Stars", "True Stars", "Avg. True Stars",
-        "Total Dest", "Avg. Dest", "Three Stars", "Two Stars", "One Stars",
-        "Zero Stars", "Missed"
-    ]
-    for col in num_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    int_cols = [
-        "Town Hall", "Wars Participated", "Number of Attacks",
-        "Total Stars", "True Stars", "Three Stars", "Two Stars",
-        "One Stars", "Zero Stars", "Missed"
-    ]
-    for col in int_cols:
-        df[col] = df[col].astype(int)
-
-    df["应出刀数"] = df["Wars Participated"] * 2
-    df["漏刀率(%)"] = df.apply(
-        lambda r: round(r["Missed"] / r["应出刀数"] * 100, 1) if r["应出刀数"] > 0 else 0.0,
-        axis=1,
-    )
-    df["三星率(%)"] = df.apply(
-        lambda r: round(r["Three Stars"] / r["Number of Attacks"] * 100, 1)
-        if r["Number of Attacks"] > 0
-        else 0.0,
-        axis=1,
-    )
-
-    def classify_status(row):
-        if row["Missed"] >= 6 or (row["Missed"] > 0 and row["Number of Attacks"] == 0):
-            return "🔴 严重漏打"
-        elif row["Missed"] > 0:
-            return "🟡 一般漏打"
-        return "🟢 全勤"
-
-    df["出勤状态"] = df.apply(classify_status, axis=1)
-
-    df = df.sort_values(
-        by=["Missed", "漏刀率(%)", "Wars Participated", "Total Stars", "Name"],
-        ascending=[False, False, False, False, True],
-    ).reset_index(drop=True)
-
-    return df
-
-
-def build_styled_excel(df: pd.DataFrame) -> bytes:
+def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "出勤与漏刀统计"
+    ws.title = sheet_title
 
     navy_fill = PatternFill(start_color="1F3864", end_color="1F3864", fill_type="solid")
     severe_fill = PatternFill(start_color="FADBD8", end_color="FADBD8", fill_type="solid")
@@ -114,26 +91,9 @@ def build_styled_excel(df: pd.DataFrame) -> bytes:
     thin = Side(style="thin", color="D0D7DE")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    export_cols = [
-        ("出勤状态", "出勤状态"),
-        ("Name", "成员名称"),
-        ("Tag", "玩家标签"),
-        ("Town Hall", "大本营"),
-        ("Wars Participated", "参战场次"),
-        ("应出刀数", "应出刀数"),
-        ("Number of Attacks", "实际出刀"),
-        ("Missed", "漏打刀数"),
-        ("漏刀率(%)", "漏刀率(%)"),
-        ("Total Stars", "总得星"),
-        ("Avg. Stars", "刀均得星"),
-        ("True Stars", "真实新星"),
-        ("Avg. True Stars", "刀均新星"),
-        ("Three Stars", "三星数"),
-        ("三星率(%)", "三星率(%)"),
-    ]
-
-    for c_idx, (_, title) in enumerate(export_cols, start=1):
-        cell = ws.cell(row=1, column=c_idx, value=title)
+    cols = list(df.columns)
+    for c_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=1, column=c_idx, value=col_name)
         cell.fill = navy_fill
         cell.font = font_header
         cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -142,29 +102,27 @@ def build_styled_excel(df: pd.DataFrame) -> bytes:
 
     for r_idx, row in df.iterrows():
         excel_r = r_idx + 2
-        missed = row["Missed"]
-        attacks = row["Number of Attacks"]
-        is_severe = missed >= 6 or (missed > 0 and attacks == 0)
-        is_minor = missed > 0 and not is_severe
+        status_val = str(row.get("出勤状态", ""))
+        is_severe = "严重" in status_val or "未出刀" in status_val
+        is_minor = "一般" in status_val or "差1刀" in status_val
 
         row_fill = severe_fill if is_severe else (minor_fill if is_minor else (zebra_fill if r_idx % 2 == 1 else white_fill))
         row_font = font_severe if is_severe else (font_minor if is_minor else font_data)
 
-        for c_idx, (col_key, _) in enumerate(export_cols, start=1):
-            val = row[col_key]
+        for c_idx, col_name in enumerate(cols, start=1):
+            val = row[col_name]
             cell = ws.cell(row=excel_r, column=c_idx, value=val)
             cell.fill = row_fill
             cell.font = row_font
             cell.border = border
-            cell.alignment = Alignment(horizontal="left" if col_key == "Name" else "center", vertical="center")
-            if col_key == "出勤状态" and missed == 0:
+            cell.alignment = Alignment(horizontal="left" if "名称" in col_name else "center", vertical="center")
+            if col_name == "出勤状态" and not is_severe and not is_minor:
                 cell.fill = ok_fill
                 cell.font = font_ok
         ws.row_dimensions[excel_r].height = 21
 
-    for c_idx in range(1, len(export_cols) + 1):
-        ws.column_dimensions[get_column_letter(c_idx)].width = 14
-    ws.column_dimensions["B"].width = 18
+    for c_idx in range(1, len(cols) + 1):
+        ws.column_dimensions[get_column_letter(c_idx)].width = 15
     ws.freeze_panes = "C2"
 
     buf = io.BytesIO()
@@ -172,148 +130,289 @@ def build_styled_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-st.title("⚔️ 萌面打劫 — 部落战出勤与漏刀看板")
-st.caption("直连 ClashPerk 导出的 Google Sheets，自动分级高亮漏打成员并生成群通知")
+st.title("⚔️ 萌面打劫 (#2YR9JVCG8) — 部落战全自动监控台")
+st.caption("支持直连 Supercell 官方接口实时催刀、GitHub Actions 自动累计历史场次，以及 ClashPerk 历史数据导入")
 
-with st.sidebar:
-    st.header("📥 数据源设置")
-    source_mode = st.radio("选择导入方式", ["粘贴 Google Sheet 链接", "上传本地 Excel / CSV"])
+tab_live, tab_history, tab_clashperk = st.tabs([
+    "🔴 实时部落战（当前催刀）",
+    "📊 自动归档统计（最近15场）",
+    "📁 ClashPerk 表格导入（备用）",
+])
 
-    raw_df = None
-    if source_mode == "粘贴 Google Sheet 链接":
-        sheet_url = st.text_input(
-            "ClashPerk Google Sheet 链接",
-            value=DEFAULT_SHEET_URL,
-            help="在 Discord 使用 /export wars 后，复制 Google Sheet 按钮链接粘贴到此处",
+with tab_live:
+    token = get_api_token()
+    if not token:
+        st.warning(
+            "尚未检测到 `COC_API_TOKEN`。请在 Streamlit App 设置的 **Secrets** 中添加 "
+            '`COC_API_TOKEN = "你的Supercell_API_Key"` 即可开启实时战况与自动抓拍。'
         )
-        if st.button("🔄 立即刷新数据", use_container_width=True):
-            st.cache_data.clear()
-        if sheet_url:
-            try:
-                raw_df = load_from_gsheet(sheet_url)
-            except Exception as e:
-                st.error(f"读取 Google Sheet 失败，请确认链接已开启查看权限。错误详情：{e}")
     else:
-        uploaded = st.file_uploader("上传 War Stats 文件 (.xlsx / .csv)", type=["xlsx", "csv"])
-        if uploaded is not None:
-            if uploaded.name.endswith(".csv"):
-                raw_df = pd.read_csv(uploaded)
+        col_btn, _ = st.columns([1, 4])
+        with col_btn:
+            if st.button("🔄 刷新实时战况", use_container_width=True):
+                st.cache_data.clear()
+
+        try:
+            war = fetch_live_war(CLAN_TAG, token)
+            state = war.get("state", "notInWar")
+            state_map = {
+                "notInWar": "⚪ 当前未开战",
+                "preparation": "🟡 备战日（准备中）",
+                "inWar": "🔴 战斗日进行中",
+                "warEnded": "🏁 本场已结束（结算中）",
+            }
+            st.subheader(f"当前状态：{state_map.get(state, state)}")
+
+            if state == "notInWar":
+                st.info("部落目前没有正在进行的常规部落战。开战后刷新此页面即可实时查看未出刀名单。")
             else:
-                raw_df = pd.read_excel(uploaded)
+                clan_info = war.get("clan", {})
+                opp_info = war.get("opponent", {})
+                team_size = war.get("teamSize", 0)
+                atk_limit = war.get("attacksPerMember", 2)
 
-    st.divider()
-    st.header("🔍 筛选条件")
-    only_missed = st.checkbox("仅显示有漏打的成员", value=False)
-    min_wars = st.slider("最低参战场次", min_value=1, max_value=15, value=1)
-    min_missed = st.slider("最低漏打刀数", min_value=0, max_value=15, value=0)
+                end_dt = parse_coc_time(war.get("endTime", ""))
+                remain_str = "-"
+                if end_dt:
+                    diff = end_dt - datetime.now(timezone.utc)
+                    if diff.total_seconds() > 0:
+                        hrs = int(diff.total_seconds() // 3600)
+                        mins = int((diff.total_seconds() % 3600) // 60)
+                        remain_str = f"{hrs} 小时 {mins} 分钟"
+                    else:
+                        remain_str = "已结束"
 
-if raw_df is None:
-    st.info("请在左侧输入有效的 Google Sheet 链接或上传文件。")
-    st.stop()
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("对战规模", f"{team_size} vs {team_size}")
+                m2.metric("我方总星 / 摧毁率", f"{clan_info.get('stars', 0)} ★ ({clan_info.get('destructionPercentage', 0):.1f}%)")
+                m3.metric("敌方总星 / 摧毁率", f"{opp_info.get('stars', 0)} ★ ({opp_info.get('destructionPercentage', 0):.1f}%)")
+                m4.metric("距离结束剩余", remain_str)
 
-try:
-    df = process_war_data(raw_df)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
+                members = clan_info.get("members", [])
+                live_rows = []
+                for m in sorted(members, key=lambda x: x.get("mapPosition", 999)):
+                    atks = m.get("attacks", []) or []
+                    used = len(atks)
+                    rem = max(0, atk_limit - used)
+                    stars = sum(int(a.get("stars", 0)) for a in atks)
+                    if rem == atk_limit:
+                        st_label = "🔴 0刀未出"
+                    elif rem > 0:
+                        st_label = f"🟡 差{rem}刀"
+                    else:
+                        st_label = "🟢 已出满"
 
-total_members = len(df)
-full_cnt = int((df["Missed"] == 0).sum())
-missed_cnt = int((df["Missed"] > 0).sum())
-severe_cnt = int(df["出勤状态"].str.contains("严重").sum())
-total_expected = int(df["应出刀数"].sum())
-total_missed = int(df["Missed"].sum())
-clan_miss_rate = round(total_missed / total_expected * 100, 1) if total_expected > 0 else 0.0
+                    live_rows.append({
+                        "出勤状态": st_label,
+                        "编号": m.get("mapPosition", 0),
+                        "成员名称": m.get("name", ""),
+                        "玩家标签": m.get("tag", ""),
+                        "大本营": m.get("townhallLevel", 0),
+                        "已出刀": used,
+                        "剩余刀数": rem,
+                        "本场得星": stars,
+                    })
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("参战总人数", f"{total_members} 人")
-c2.metric("全勤人数 (0漏打)", f"{full_cnt} 人")
-c3.metric("漏打人数", f"{missed_cnt} 人", delta=f"严重 {severe_cnt} 人", delta_color="inverse")
-c4.metric("累计漏打刀数", f"{total_missed} / {total_expected} 刀")
-c5.metric("部落整体漏刀率", f"{clan_miss_rate}%")
+                live_df = pd.DataFrame(live_rows)
+                live_df = live_df.sort_values(by=["剩余刀数", "编号"], ascending=[False, True]).reset_index(drop=True)
 
-st.divider()
+                def style_live(r):
+                    s = str(r["出勤状态"])
+                    if "🔴" in s:
+                        return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+                    elif "🟡" in s:
+                        return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
+                    return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
 
-filtered_df = df[df["Wars Participated"] >= min_wars].copy()
-if only_missed:
-    filtered_df = filtered_df[filtered_df["Missed"] > 0]
-if min_missed > 0:
-    filtered_df = filtered_df[filtered_df["Missed"] >= min_missed]
+                st.dataframe(
+                    live_df.style.apply(style_live, axis=1),
+                    use_container_width=True,
+                    height=520,
+                    hide_index=True,
+                )
 
-display_cols = [
-    "出勤状态", "Name", "Tag", "Town Hall", "Wars Participated",
-    "应出刀数", "Number of Attacks", "Missed", "漏刀率(%)",
-    "Total Stars", "Avg. Stars", "Avg. True Stars", "三星率(%)"
-]
-rename_map = {
-    "Name": "成员名称",
-    "Tag": "玩家标签",
-    "Town Hall": "大本营",
-    "Wars Participated": "参战场次",
-    "Number of Attacks": "实际出刀",
-    "Missed": "漏打刀数",
-    "Total Stars": "总得星",
-    "Avg. Stars": "刀均得星",
-    "Avg. True Stars": "刀均新星",
-}
+                zero_df = live_df[live_df["已出刀"] == 0]
+                one_df = live_df[(live_df["已出刀"] > 0) & (live_df["剩余刀数"] > 0)]
+                if state == "inWar" and (not zero_df.empty or not one_df.empty):
+                    st.subheader("📢 一键复制实时催刀通知")
+                    txt_lines = [
+                        f"【萌面打劫 部落战催刀提醒】距离结束还剩 {remain_str}",
+                        f"当前比分：{clan_info.get('stars', 0)} ★ vs {opp_info.get('stars', 0)} ★",
+                        "",
+                    ]
+                    if not zero_df.empty:
+                        txt_lines.append("🔴 一刀未出（请尽快上线出刀）：")
+                        txt_lines.append("、".join(f"#{r['编号']} {r['成员名称']}" for _, r in zero_df.iterrows()))
+                        txt_lines.append("")
+                    if not one_df.empty:
+                        txt_lines.append("🟡 还剩 1 刀（记得补刀）：")
+                        txt_lines.append("、".join(f"#{r['编号']} {r['成员名称']}" for _, r in one_df.iterrows()))
+                    st.code("\n".join(txt_lines), language="text")
+        except Exception as e:
+            st.error(f"获取实时部落战失败：{e}")
 
-show_df = filtered_df[display_cols].rename(columns=rename_map)
+with tab_history:
+    if not os.path.exists(HISTORY_FILE):
+        st.info("`war_history.csv` 尚未生成。配置好 GitHub Actions 定时任务后，每场部落战结束都会自动写入此文件。")
+    else:
+        hist_df = pd.read_csv(HISTORY_FILE)
+        if hist_df.empty:
+            st.info("历史存档暂无记录，等待当前或下一场部落战开始后即可自动记录。")
+        else:
+            unique_wars = sorted(hist_df["war_id"].astype(str).unique().tolist())
+            total_recorded = len(unique_wars)
+            default_n = min(15, total_recorded)
 
+            c_slider, c_check = st.columns([2, 1])
+            with c_slider:
+                last_n = st.slider(
+                    f"选择统计最近几场部落战（当前库内共已存档 {total_recorded} 场）",
+                    min_value=1,
+                    max_value=max(1, total_recorded),
+                    value=default_n,
+                )
+            with c_check:
+                st.write("")
+                only_miss_hist = st.checkbox("仅显示有漏打成员", value=False, key="hist_only_miss")
 
-def highlight_rows(row):
-    status = str(row["出勤状态"])
-    if "严重" in status:
-        return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(row)
-    elif "一般" in status:
-        return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(row)
-    return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(row) - 1)
+            target_war_ids = set(unique_wars[-last_n:])
+            sub = hist_df[hist_df["war_id"].astype(str).isin(target_war_ids)].copy()
 
+            grouped = (
+                sub.groupby(["player_tag", "player_name"], as_index=False)
+                .agg(
+                    大本营=("town_hall", "max"),
+                    参战场次=("war_id", "nunique"),
+                    应出刀数=("attacks_per_member", "sum"),
+                    实际出刀=("attacks_used", "sum"),
+                    漏打刀数=("attacks_missed", "sum"),
+                    总得星=("total_stars", "sum"),
+                    三星数=("three_stars", "sum"),
+                )
+            )
+            grouped["漏刀率(%)"] = (grouped["漏打刀数"] / grouped["应出刀数"] * 100).round(1)
+            grouped["刀均得星"] = grouped.apply(
+                lambda r: round(r["总得星"] / r["实际出刀"], 2) if r["实际出刀"] > 0 else 0.0, axis=1
+            )
+            grouped["三星率(%)"] = grouped.apply(
+                lambda r: round(r["三星数"] / r["实际出刀"] * 100, 1) if r["实际出刀"] > 0 else 0.0, axis=1
+            )
 
-st.subheader(f"📋 成员出勤明细表（当前显示 {len(show_df)} 人）")
-st.dataframe(
-    show_df.style.apply(highlight_rows, axis=1).format({
-        "漏刀率(%)": "{:.1f}%",
-        "三星率(%)": "{:.1f}%",
-        "刀均得星": "{:.2f}",
-        "刀均新星": "{:.2f}",
-    }),
-    use_container_width=True,
-    height=560,
-    hide_index=True,
-)
+            def tag_hist_status(r):
+                if r["漏打刀数"] >= 6 or (r["漏打刀数"] > 0 and r["实际出刀"] == 0):
+                    return "🔴 严重漏打"
+                elif r["漏打刀数"] > 0:
+                    return "🟡 一般漏打"
+                return "🟢 全勤"
 
-col_left, col_right = st.columns([1, 1.4])
+            grouped["出勤状态"] = grouped.apply(tag_hist_status, axis=1)
+            grouped = grouped.sort_values(
+                by=["漏打刀数", "漏刀率(%)", "参战场次", "总得星"],
+                ascending=[False, False, False, False],
+            ).reset_index(drop=True)
 
-with col_left:
-    st.subheader("📥 导出高亮版 Excel")
-    st.write("下载已自动置顶并红黄高亮标注的完整 `.xlsx` 表格，方便存档或发群。")
-    excel_bytes = build_styled_excel(filtered_df)
-    st.download_button(
-        label="⬇️ 下载高亮统计表 (.xlsx)",
-        data=excel_bytes,
-        file_name="萌面打劫_部落战出勤统计.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+            cols_order = [
+                "出勤状态", "player_name", "player_tag", "大本营",
+                "参战场次", "应出刀数", "实际出刀", "漏打刀数", "漏刀率(%)",
+                "总得星", "刀均得星", "三星数", "三星率(%)"
+            ]
+            grouped = grouped[cols_order].rename(columns={"player_name": "成员名称", "player_tag": "玩家标签"})
 
-with col_right:
-    st.subheader("📢 一键复制群通知文案")
-    severe_list = df[df["出勤状态"].str.contains("严重")]
-    minor_list = df[df["出勤状态"].str.contains("一般")]
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("统计场次", f"最近 {len(target_war_ids)} 场")
+            k2.metric("全勤人数", f"{int((grouped['漏打刀数'] == 0).sum())} 人")
+            k3.metric("漏打人数", f"{int((grouped['漏打刀数'] > 0).sum())} 人")
+            k4.metric("累计漏打刀数", f"{int(grouped['漏打刀数'].sum())} 刀")
 
-    lines = [
-        "【萌面打劫 部落战出勤通报】",
-        f"统计范围：近 {df['Wars Participated'].max()} 场常规战 | 全勤 {full_cnt} 人 | 漏打 {missed_cnt} 人（累计漏 {total_missed} 刀）",
-        "",
-        "🔴 严重漏打 / 全鸽名单（请自觉调整红牌或说明情况）：",
-    ]
-    for _, r in severe_list.iterrows():
-        lines.append(f"- {r['Name']}：漏 {r['Missed']} 刀（出刀 {r['Number of Attacks']}/{r['应出刀数']}，漏刀率 {r['漏刀率(%)']}%）")
+            view_hist = grouped[grouped["漏打刀数"] > 0] if only_miss_hist else grouped
 
-    lines.append("")
-    lines.append("🟡 一般漏打提醒（注意战前定好闹钟）：")
-    for _, r in minor_list.iterrows():
-        lines.append(f"- {r['Name']}：漏 {r['Missed']} 刀（出刀 {r['Number of Attacks']}/{r['应出刀数']}）")
+            def style_hist(r):
+                s = str(r["出勤状态"])
+                if "严重" in s:
+                    return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+                elif "一般" in s:
+                    return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
+                return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
 
-    notice_text = "\n".join(lines)
-    st.code(notice_text, language="text")
+            st.dataframe(
+                view_hist.style.apply(style_hist, axis=1).format({
+                    "漏刀率(%)": "{:.1f}%",
+                    "三星率(%)": "{:.1f}%",
+                    "刀均得星": "{:.2f}",
+                }),
+                use_container_width=True,
+                height=520,
+                hide_index=True,
+            )
+
+            col_dl, col_txt = st.columns([1, 1.4])
+            with col_dl:
+                st.download_button(
+                    label=f"⬇️ 下载最近{len(target_war_ids)}场出勤表 (.xlsx)",
+                    data=build_excel_bytes(view_hist, f"最近{len(target_war_ids)}场统计"),
+                    file_name=f"萌面打劫_最近{len(target_war_ids)}场出勤统计.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with col_txt:
+                sev = grouped[grouped["出勤状态"].str.contains("严重")]
+                min_l = grouped[grouped["出勤状态"].str.contains("一般")]
+                msg = [
+                    f"【萌面打劫 最近 {len(target_war_ids)} 场部落战出勤通报】",
+                    f"全勤 {int((grouped['漏打刀数'] == 0).sum())} 人 | 漏打 {int((grouped['漏打刀数'] > 0).sum())} 人（累计漏 {int(grouped['漏打刀数'].sum())} 刀）",
+                    "",
+                    "🔴 严重漏打 / 全鸽名单：",
+                ]
+                for _, r in sev.iterrows():
+                    msg.append(f"- {r['成员名称']}：漏 {r['漏打刀数']} 刀（出刀 {r['实际出刀']}/{r['应出刀数']}，漏刀率 {r['漏刀率(%)']}%）")
+                msg.append("")
+                msg.append("🟡 一般漏打提醒：")
+                for _, r in min_l.iterrows():
+                    msg.append(f"- {r['成员名称']}：漏 {r['漏打刀数']} 刀（出刀 {r['实际出刀']}/{r['应出刀数']}）")
+                st.code("\n".join(msg), language="text")
+
+with tab_clashperk:
+    st.write("在新数据库攒够 15 场之前，可继续在此处粘贴 ClashPerk 导出的 Google Sheet 链接查看历史记录。")
+    gs_url = st.text_input("ClashPerk Google Sheet 链接", value=DEFAULT_SHEET_URL)
+    if gs_url:
+        try:
+            cp_raw = load_gsheet(gs_url).dropna(subset=["Name"]).copy()
+            cp_raw["应出刀数"] = cp_raw["Wars Participated"].astype(int) * 2
+            cp_raw["漏刀率(%)"] = (cp_raw["Missed"].astype(int) / cp_raw["应出刀数"] * 100).round(1)
+            cp_raw["出勤状态"] = cp_raw.apply(
+                lambda r: "🔴 严重漏打"
+                if (int(r["Missed"]) >= 6 or (int(r["Missed"]) > 0 and int(r["Number of Attacks"]) == 0))
+                else ("🟡 一般漏打" if int(r["Missed"]) > 0 else "🟢 全勤"),
+                axis=1,
+            )
+            cp_sorted = cp_raw.sort_values(by=["Missed", "漏刀率(%)"], ascending=[False, False]).reset_index(drop=True)
+            cp_view = cp_sorted[
+                ["出勤状态", "Name", "Tag", "Wars Participated", "应出刀数", "Number of Attacks", "Missed", "漏刀率(%)", "Total Stars", "Avg. Stars"]
+            ].rename(
+                columns={
+                    "Name": "成员名称",
+                    "Tag": "玩家标签",
+                    "Wars Participated": "参战场次",
+                    "Number of Attacks": "实际出刀",
+                    "Missed": "漏打刀数",
+                    "Total Stars": "总得星",
+                    "Avg. Stars": "刀均得星",
+                }
+            )
+
+            def style_cp(r):
+                s = str(r["出勤状态"])
+                if "严重" in s:
+                    return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+                elif "一般" in s:
+                    return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
+                return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
+
+            st.dataframe(
+                cp_view.style.apply(style_cp, axis=1).format({"漏刀率(%)": "{:.1f}%", "刀均得星": "{:.2f}"}),
+                use_container_width=True,
+                height=500,
+                hide_index=True,
+            )
+        except Exception as e:
+            st.error(f"加载 Google Sheet 失败：{e}")
