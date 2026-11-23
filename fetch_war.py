@@ -5,17 +5,23 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
-CLAN_TAG = os.getenv("COC_CLAN_TAG", "#2YR9JVCG8").strip()
+CLANS = [
+    {"name": "萌面打劫", "tag": "#2YR9JVCG8"},
+    {"name": "萌虎下山", "tag": "#2JLC9Q8LL"},
+    {"name": "小倔强", "tag": "#2CVRYQ9C"},
+]
+
 API_TOKEN = os.getenv("COC_API_TOKEN", "").strip()
 API_BASE = os.getenv("COC_API_BASE", "https://cocproxy.royaleapi.dev/v1").rstrip("/")
 HISTORY_FILE = "war_history.csv"
 
 COLUMNS = [
+    "clan_tag",
+    "clan_name",
     "war_id",
     "war_state",
     "start_time",
     "end_time",
-    "clan_name",
     "opponent_name",
     "team_size",
     "attacks_per_member",
@@ -48,14 +54,14 @@ def fetch_current_war(clan_tag: str, token: str) -> dict:
     }
     resp = requests.get(url, headers=headers, timeout=20)
     if resp.status_code != 200:
-        raise RuntimeError(f"Supercell API 请求失败 (HTTP {resp.status_code}): {resp.text}")
+        raise RuntimeError(f"[{clan_tag}] API 请求失败 (HTTP {resp.status_code}): {resp.text}")
     return resp.json()
 
 
-def parse_war_to_rows(data: dict) -> pd.DataFrame:
+def parse_war_to_rows(clan_tag: str, default_name: str, data: dict) -> pd.DataFrame:
     state = data.get("state", "notInWar")
     if state not in ("inWar", "warEnded"):
-        print(f"当前部落战状态为 {state}（非战斗日/已结束状态），跳过记录。")
+        print(f"[{default_name} {clan_tag}] 当前状态为 {state}，跳过记录。")
         return pd.DataFrame(columns=COLUMNS)
 
     war_id = data.get("preparationStartTime", "")
@@ -66,7 +72,7 @@ def parse_war_to_rows(data: dict) -> pd.DataFrame:
 
     clan = data.get("clan", {})
     opponent = data.get("opponent", {})
-    clan_name = clan.get("name", "萌面打劫")
+    clan_name = clan.get("name", default_name)
     opponent_name = opponent.get("name", "未知对手")
     members = clan.get("members", [])
 
@@ -85,11 +91,12 @@ def parse_war_to_rows(data: dict) -> pd.DataFrame:
         s0 = sum(1 for a in attacks if int(a.get("stars", 0)) == 0)
 
         rows.append({
+            "clan_tag": clan_tag,
+            "clan_name": clan_name,
             "war_id": war_id,
             "war_state": state,
             "start_time": start_time,
             "end_time": end_time,
-            "clan_name": clan_name,
             "opponent_name": opponent_name,
             "team_size": team_size,
             "attacks_per_member": attacks_per_member,
@@ -111,32 +118,59 @@ def parse_war_to_rows(data: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=COLUMNS)
 
 
-def update_history_csv(new_df: pd.DataFrame, filepath: str = HISTORY_FILE) -> None:
+def update_history_csv(all_new_dfs: list, filepath: str = HISTORY_FILE) -> None:
     if os.path.exists(filepath):
         old_df = pd.read_csv(filepath)
+        if "clan_tag" not in old_df.columns:
+            old_df["clan_tag"] = "#2YR9JVCG8"
     else:
         old_df = pd.DataFrame(columns=COLUMNS)
 
-    if new_df.empty:
+    valid_dfs = [d for d in all_new_dfs if not d.empty]
+    if not valid_dfs:
         if not os.path.exists(filepath):
             old_df.to_csv(filepath, index=False, encoding="utf-8-sig")
         return
 
-    current_war_id = new_df["war_id"].iloc[0]
-    if not old_df.empty and "war_id" in old_df.columns:
-        old_df = old_df[old_df["war_id"].astype(str) != str(current_war_id)]
+    combined_new = pd.concat(valid_dfs, ignore_index=True)
 
-    combined = pd.concat([old_df, new_df], ignore_index=True)
-    combined = combined.sort_values(by=["war_id", "map_position"], ascending=[True, True])
-    combined.to_csv(filepath, index=False, encoding="utf-8-sig")
-    print(f"已成功更新场次 {current_war_id}（状态: {new_df['war_state'].iloc[0]}），共 {len(new_df)} 名参战成员。")
+    if not old_df.empty:
+        new_keys = set(zip(combined_new["clan_tag"].astype(str), combined_new["war_id"].astype(str)))
+        mask_keep = [
+            (str(ct), str(wid)) not in new_keys
+            for ct, wid in zip(old_df["clan_tag"].astype(str), old_df["war_id"].astype(str))
+        ]
+        old_df = old_df[mask_keep]
+
+    final_df = pd.concat([old_df, combined_new], ignore_index=True)
+    final_df = final_df.sort_values(by=["clan_tag", "war_id", "map_position"], ascending=[True, True, True])
+    final_df.to_csv(filepath, index=False, encoding="utf-8-sig")
+    print(f"历史战绩库已更新，本次写入 {len(combined_new)} 条成员记录。")
 
 
 if __name__ == "__main__":
-    try:
-        war_json = fetch_current_war(CLAN_TAG, API_TOKEN)
-        df_war = parse_war_to_rows(war_json)
-        update_history_csv(df_war, HISTORY_FILE)
-    except Exception as exc:
-        print(f"执行出错: {exc}", file=sys.stderr)
+    collected = []
+    has_error = False
+
+    for item in CLANS:
+        c_name = item["name"]
+        c_tag = item["tag"].strip().upper()
+        if not c_tag or "第" in c_tag or "TAG" in c_tag:
+            print(f"跳过未配置标签的占位部落：{c_name}")
+            continue
+        if not c_tag.startswith("#"):
+            c_tag = "#" + c_tag
+
+        try:
+            war_json = fetch_current_war(c_tag, API_TOKEN)
+            df_war = parse_war_to_rows(c_tag, c_name, war_json)
+            collected.append(df_war)
+            if not df_war.empty:
+                print(f"[{c_name} {c_tag}] 抓拍成功（状态: {df_war['war_state'].iloc[0]}，{len(df_war)}人）")
+        except Exception as exc:
+            print(f"[{c_name} {c_tag}] 抓取警告: {exc}", file=sys.stderr)
+            has_error = True
+
+    update_history_csv(collected, HISTORY_FILE)
+    if has_error and not collected:
         sys.exit(1)
