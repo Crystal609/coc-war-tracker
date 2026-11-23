@@ -21,13 +21,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pandas requests gspread google-auth
+        run: pip install pandas requests
 
       - name: Fetch and archive clan war & CWL
         env:
           COC_API_TOKEN: ${{ secrets.COC_API_TOKEN }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SHEET_WEBHOOK_URL: ${{ secrets.GOOGLE_SHEET_WEBHOOK_URL }}
         run: python fetch_war.py
 
       - name: Commit updated CSV history
