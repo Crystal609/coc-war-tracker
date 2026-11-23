@@ -17,40 +17,26 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# 在这里配置你的三个部落（把第三个部落的 #TAG 替换成游戏里的实际标签即可）
 CLANS = [
-    {
-        "name": "萌面打劫",
-        "tag": "#2YR9JVCG8",
-        "default_sheet": "https://docs.google.com/spreadsheets/d/1GYL8qHNSyG8rGXycw_mbYIy-BuCpxlYPfYH7aYTvwPg/edit?gid=0#gid=0",
-    },
-    {
-        "name": "萌虎下山",
-        "tag": "#2JLC9Q8LL",
-        "default_sheet": "",
-    },
-    {
-        "name": "小倔强",
-        "tag": "#2CVRYQ9C",
-        "default_sheet": "",
-    },
+    {"name": "萌面打劫", "tag": "#2YR9JVCG8"},
+    {"name": "萌虎下山", "tag": "#2JLC9Q8LL"},
+    {"name": "小倔强", "tag": "#2CVRYQ9C"},
 ]
 
 API_BASE = "https://cocproxy.royaleapi.dev/v1"
-HISTORY_FILE = "war_history.csv"
+WAR_HISTORY_FILE = "war_history.csv"
+CWL_HISTORY_FILE = "cwl_history.csv"
 
 st.markdown(
     """
     <style>
-    /* 修复顶部留白，避免被 Streamlit 顶部工具栏遮挡 */
     .block-container {
         padding-top: 3.4rem !important;
         padding-bottom: 2.2rem !important;
         padding-left: 0.9rem !important;
         padding-right: 0.9rem !important;
-        max-width: 820px;
+        max-width: 860px;
     }
-    /* 顶部部落横向切换按钮美化 */
     div[data-testid="stRadio"] > div {
         background: #f1f5f9;
         padding: 6px 10px;
@@ -142,13 +128,13 @@ def render_kpi_grid(items):
     st.markdown("".join(cards_html), unsafe_allow_html=True)
 
 
-def get_api_token() -> str:
+def get_secret_val(key_name: str) -> str:
     try:
-        if "COC_API_TOKEN" in st.secrets:
-            return str(st.secrets["COC_API_TOKEN"]).strip()
+        if key_name in st.secrets:
+            return str(st.secrets[key_name]).strip()
     except Exception:
         pass
-    return os.getenv("COC_API_TOKEN", "").strip()
+    return os.getenv(key_name, "").strip()
 
 
 def parse_coc_time(ts: str):
@@ -161,36 +147,81 @@ def parse_coc_time(ts: str):
 
 
 @st.cache_data(ttl=60)
-def fetch_live_war(clan_tag: str, token: str) -> dict:
-    encoded = urllib.parse.quote(clan_tag)
-    url = f"{API_BASE}/clans/{encoded}/currentwar"
+def fetch_api_json(path: str, token: str) -> dict | None:
+    url = f"{API_BASE}{path}"
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
         timeout=15,
     )
+    if resp.status_code == 404:
+        return None
     if resp.status_code != 200:
         raise RuntimeError(f"API 请求失败 ({resp.status_code}): {resp.text}")
     return resp.json()
 
 
-def convert_gsheet_to_csv_url(url: str) -> str:
-    url = url.strip()
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-    if not match:
-        return url
-    sheet_id = match.group(1)
-    gid_match = re.search(r"[?&#]gid=([0-9]+)", url)
-    gid = gid_match.group(1) if gid_match else "0"
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-
-
 @st.cache_data(ttl=120)
-def load_gsheet(url: str) -> pd.DataFrame:
-    return pd.read_csv(convert_gsheet_to_csv_url(url))
+def fetch_live_cwl_rows(clan_tag: str, clan_name: str, token: str) -> pd.DataFrame:
+    encoded = urllib.parse.quote(clan_tag)
+    group = fetch_api_json(f"/clans/{encoded}/currentwar/leaguegroup", token)
+    if not group or group.get("state") == "notInWar":
+        return pd.DataFrame()
+
+    season = str(group.get("season", datetime.now(timezone.utc).strftime("%Y-%m")))
+    rounds = group.get("rounds", [])
+    rows = []
+
+    for r_idx, rnd in enumerate(rounds, start=1):
+        for w_tag in rnd.get("warTags", []):
+            if not w_tag or w_tag == "#0":
+                continue
+            w_data = fetch_api_json(f"/clanwarleagues/wars/{urllib.parse.quote(w_tag)}", token)
+            if not w_data:
+                continue
+            c1 = w_data.get("clan", {})
+            c2 = w_data.get("opponent", {})
+            if str(c1.get("tag", "")).upper() == clan_tag.upper():
+                our_clan, opp_clan = c1, c2
+            elif str(c2.get("tag", "")).upper() == clan_tag.upper():
+                our_clan, opp_clan = c2, c1
+            else:
+                continue
+
+            w_state = w_data.get("state", "preparation")
+            if w_state not in ("inWar", "warEnded"):
+                break
+
+            for m in our_clan.get("members", []):
+                atks = m.get("attacks", []) or []
+                used = len(atks)
+                missed = max(0, 1 - used)
+                stars = sum(int(a.get("stars", 0)) for a in atks)
+                dest = sum(float(a.get("destructionPercentage", 0.0)) for a in atks)
+                rows.append({
+                    "clan_tag": clan_tag,
+                    "clan_name": our_clan.get("name", clan_name),
+                    "season": season,
+                    "round_num": r_idx,
+                    "war_tag": w_tag,
+                    "war_state": w_state,
+                    "opponent_name": opp_clan.get("name", "未知对手"),
+                    "team_size": int(w_data.get("teamSize", 15)),
+                    "player_tag": m.get("tag", ""),
+                    "player_name": m.get("name", ""),
+                    "town_hall": int(m.get("townhallLevel", 0)),
+                    "map_position": int(m.get("mapPosition", 0)),
+                    "attacks_used": used,
+                    "attacks_missed": missed,
+                    "stars": stars,
+                    "destruction": round(dest, 1),
+                })
+            break
+
+    return pd.DataFrame(rows)
 
 
-def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> bytes:
+def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "统计表") -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet_title
@@ -222,9 +253,9 @@ def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> by
 
     for r_idx, row in df.iterrows():
         excel_r = r_idx + 2
-        status_val = str(row.get("状态", row.get("出勤状态", "")))
-        is_severe = "严重" in status_val or "0刀" in status_val
-        is_minor = "漏打" in status_val or "差1刀" in status_val
+        status_val = str(row.get("状态", ""))
+        is_severe = "严重" in status_val or "0刀" in status_val or "漏" in status_val
+        is_minor = "差1刀" in status_val or "未满8星" in status_val
 
         row_fill = severe_fill if is_severe else (minor_fill if is_minor else (zebra_fill if r_idx % 2 == 1 else white_fill))
         row_font = font_severe if is_severe else (font_minor if is_minor else font_data)
@@ -236,13 +267,13 @@ def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> by
             cell.font = row_font
             cell.border = border
             cell.alignment = Alignment(horizontal="left" if "成员" in col_name else "center", vertical="center")
-            if col_name in ("状态", "出勤状态") and not is_severe and not is_minor:
+            if col_name == "状态" and not is_severe and not is_minor:
                 cell.fill = ok_fill
                 cell.font = font_ok
         ws.row_dimensions[excel_r].height = 21
 
     for c_idx in range(1, len(cols) + 1):
-        ws.column_dimensions[get_column_letter(c_idx)].width = 14
+        ws.column_dimensions[get_column_letter(c_idx)].width = 12
     ws.freeze_panes = "C2"
 
     buf = io.BytesIO()
@@ -250,7 +281,7 @@ def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> by
     return buf.getvalue()
 
 
-# ==================== 顶部一键切换部落（横向按钮，手机一点即切） ====================
+# ==================== 顶部一键切换部落 ====================
 clan_names = [c["name"] for c in CLANS]
 selected_name = st.radio(
     "🏰 点击切换部落：",
@@ -260,45 +291,40 @@ selected_name = st.radio(
 selected_clan = next(c for c in CLANS if c["name"] == selected_name)
 ACTIVE_NAME = selected_clan["name"]
 ACTIVE_TAG = selected_clan["tag"].strip().upper()
-ACTIVE_SHEET = selected_clan["default_sheet"]
+BACKUP_SHEET_ID = get_secret_val("GOOGLE_SHEET_ID")
 
-# 如果第3个部落还没在代码里改标签，支持直接在网页临时输入查看
-if "第" in ACTIVE_TAG or "TAG" in ACTIVE_TAG:
-    custom_tag = st.text_input(
-        f"输入 {ACTIVE_NAME} 的部落标签（例如 #2PP0J9L8）即可立即查看：",
-        placeholder="#XXXXXXXX",
-    ).strip().upper()
-    if custom_tag:
-        ACTIVE_TAG = custom_tag if custom_tag.startswith("#") else f"#{custom_tag}"
+header_extra = ""
+if BACKUP_SHEET_ID:
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{BACKUP_SHEET_ID}/edit"
+    header_extra = f' · <a href="{sheet_url}" target="_blank" style="color:#38bdf8;text-decoration:none;">📊 打开云端Sheet备份</a>'
 
 st.markdown(
     f"""
     <div class="clan-header">
         <div class="clan-title">⚔️ {ACTIVE_NAME} ({ACTIVE_TAG})</div>
-        <div class="clan-sub">实时催刀 · 自动归档历史 · 漏打红黄高亮</div>
+        <div class="clan-sub">每30分钟全自动抓拍归档 · 三部落独立统计{header_extra}</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-tab_live, tab_history, tab_clashperk = st.tabs([
+tab_live, tab_history, tab_cwl = st.tabs([
     "🔴 实时催刀",
-    "📊 自动归档",
-    "📁 表格导入",
+    "📊 常规战归档",
+    "🏆 七天联赛",
 ])
 
 with tab_live:
-    token = get_api_token()
+    token = get_secret_val("COC_API_TOKEN")
     if not token:
         st.warning("尚未检测到 `COC_API_TOKEN`，请在 Streamlit App 设置的 Secrets 中填入官方 Token。")
-    elif "第" in ACTIVE_TAG or "TAG" in ACTIVE_TAG:
-        st.info(f"请在上方输入框填写 **{ACTIVE_NAME}** 的 `#TAG`（同时建议写入 `app.py` 和 `fetch_war.py` 永久保存）。")
     else:
         if st.button("🔄 刷新实时战况", use_container_width=True):
             st.cache_data.clear()
 
         try:
-            war = fetch_live_war(ACTIVE_TAG, token)
+            encoded_tag = urllib.parse.quote(ACTIVE_TAG)
+            war = fetch_api_json(f"/clans/{encoded_tag}/currentwar", token) or {}
             state = war.get("state", "notInWar")
             state_map = {
                 "notInWar": "⚪ 当前未开战",
@@ -309,7 +335,7 @@ with tab_live:
             st.markdown(f"**当前状态：{state_map.get(state, state)}**")
 
             if state == "notInWar":
-                st.info(f"**{ACTIVE_NAME}** 目前没有正在进行的常规部落战。开战后点刷新即可实时查看未出刀名单。")
+                st.info(f"**{ACTIVE_NAME}** 目前没有正在进行的常规部落战。如果在打月度联赛，请点右侧「🏆 七天联赛」查看。")
             else:
                 clan_info = war.get("clan", {})
                 opp_info = war.get("opponent", {})
@@ -400,34 +426,32 @@ with tab_live:
             st.error(f"获取实时部落战失败：{e}")
 
 with tab_history:
-    if not os.path.exists(HISTORY_FILE):
-        st.info(
-            "💡 `war_history.csv` 尚未生成。请先去 GitHub 仓库的 **Actions** 页面点击 **Run workflow** 手动触发一次同步。"
-        )
+    if not os.path.exists(WAR_HISTORY_FILE):
+        st.info("💡 `war_history.csv` 尚未生成，请先去 GitHub 仓库的 **Actions** 页面点击 **Run workflow** 触发首次抓拍。")
     else:
-        raw_hist = pd.read_csv(HISTORY_FILE)
+        raw_hist = pd.read_csv(WAR_HISTORY_FILE)
         if "clan_tag" not in raw_hist.columns:
             raw_hist["clan_tag"] = "#2YR9JVCG8"
 
         hist_df = raw_hist[raw_hist["clan_tag"].astype(str).str.upper() == ACTIVE_TAG].copy()
 
         if hist_df.empty:
-            st.info(f"**{ACTIVE_NAME} ({ACTIVE_TAG})** 暂无自动归档记录。开战并由 GitHub Actions 抓拍后会自动显示在此处。")
+            st.info(f"**{ACTIVE_NAME} ({ACTIVE_TAG})** 暂无常规战自动归档记录，开战后每30分钟会自动抓拍入库。")
         else:
             unique_wars = sorted(hist_df["war_id"].astype(str).unique().tolist())
             total_recorded = len(unique_wars)
             default_n = min(15, total_recorded)
 
             if total_recorded <= 1:
-             last_n = 1
-             st.caption(f"📌 当前 {ACTIVE_NAME} 已归档 1 场部落战（积累 2 场及以上后可滑动选择场次范围）")
-         else:
-             last_n = st.slider(
-                 f"统计最近几场（{ACTIVE_NAME} 已归档 {total_recorded} 场）",
-                 min_value=1,
-                 max_value=total_recorded,
-                 value=default_n,
-             )
+                last_n = 1
+                st.caption(f"📌 当前 {ACTIVE_NAME} 已归档 1 场常规战（积累 2 场及以上后可滑动选择场次范围）")
+            else:
+                last_n = st.slider(
+                    f"统计最近几场（{ACTIVE_NAME} 已归档 {total_recorded} 场）",
+                    min_value=1,
+                    max_value=total_recorded,
+                    value=default_n,
+                )
 
             col_f1, col_f2 = st.columns(2)
             with col_f1:
@@ -504,13 +528,13 @@ with tab_history:
             st.dataframe(
                 view_hist[use_cols].style.apply(style_hist, axis=1).format(fmt_dict),
                 use_container_width=True,
-                height=480,
+                height=460,
                 hide_index=True,
             )
 
             st.download_button(
-                label=f"⬇️ 下载 {ACTIVE_NAME} 出勤表 (.xlsx)",
-                data=build_excel_bytes(view_hist[detail_cols], f"{ACTIVE_NAME}统计"),
+                label=f"⬇️ 下载 {ACTIVE_NAME} 常规战出勤表 (.xlsx)",
+                data=build_excel_bytes(view_hist[detail_cols], f"{ACTIVE_NAME}常规战"),
                 file_name=f"{ACTIVE_NAME}_最近{len(target_war_ids)}场出勤统计.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
@@ -533,85 +557,159 @@ with tab_history:
             st.markdown("**📢 一键复制群通知**")
             st.code("\n".join(msg), language="text")
 
-with tab_clashperk:
-    gs_url = st.text_input(
-        f"粘贴 {ACTIVE_NAME} 的 ClashPerk Google Sheet 链接",
-        value=ACTIVE_SHEET,
-        key=f"gs_input_{ACTIVE_TAG}",
-    )
-    col_cp1, col_cp2 = st.columns(2)
-    with col_cp1:
-        cp_only_miss = st.checkbox("仅看漏打成员", value=False, key="cp_only_miss")
-    with col_cp2:
-        cp_full_cols = st.checkbox("展开详细星数列", value=False, key="cp_full_cols")
+with tab_cwl:
+    token = get_secret_val("COC_API_TOKEN")
+    cwl_frames = []
 
-    if not gs_url:
-        st.info(f"在 Discord 对 **{ACTIVE_NAME}** 执行 `/export wars` 后，把生成的 Google Sheet 链接贴到上方即可查看。")
-    else:
+    if os.path.exists(CWL_HISTORY_FILE):
+        saved_cwl = pd.read_csv(CWL_HISTORY_FILE)
+        if not saved_cwl.empty:
+            cwl_frames.append(saved_cwl[saved_cwl["clan_tag"].astype(str).str.upper() == ACTIVE_TAG])
+
+    if token:
         try:
-            cp_raw = load_gsheet(gs_url).dropna(subset=["Name"]).copy()
-            cp_raw["Wars Participated"] = cp_raw["Wars Participated"].astype(int)
-            cp_raw["Number of Attacks"] = cp_raw["Number of Attacks"].astype(int)
-            cp_raw["Missed"] = cp_raw["Missed"].astype(int)
-            cp_raw["应出刀数"] = cp_raw["Wars Participated"] * 2
-            cp_raw["漏刀率(%)"] = (cp_raw["Missed"] / cp_raw["应出刀数"] * 100).round(1)
-            cp_raw["出勤"] = cp_raw.apply(lambda r: f"{r['Number of Attacks']}/{r['应出刀数']}", axis=1)
-            cp_raw["状态"] = cp_raw.apply(
-                lambda r: "🔴 严重"
-                if (r["Missed"] >= 6 or (r["Missed"] > 0 and r["Number of Attacks"] == 0))
-                else ("🟡 漏打" if r["Missed"] > 0 else "🟢 全勤"),
-                axis=1,
+            live_cwl = fetch_live_cwl_rows(ACTIVE_TAG, ACTIVE_NAME, token)
+            if not live_cwl.empty:
+                cwl_frames.append(live_cwl)
+        except Exception:
+            pass
+
+    if not cwl_frames or all(df.empty for df in cwl_frames):
+        st.info(
+            f"📅 **{ACTIVE_NAME} ({ACTIVE_TAG})** 暂无七天联赛记录。\n\n"
+            "每月月初开启部落对战联赛（CWL）后，后台每 30 分钟会自动抓拍 **DAY 1 至 DAY 7** 每一天的上场名单、出刀与得星，"
+            "并自动同步备份到你的 Google Sheet 中。"
+        )
+    else:
+        all_cwl = pd.concat([df for df in cwl_frames if not df.empty], ignore_index=True)
+        all_cwl["round_num"] = all_cwl["round_num"].astype(int)
+        all_cwl = all_cwl.drop_duplicates(subset=["season", "round_num", "player_tag"], keep="last")
+
+        seasons = sorted(all_cwl["season"].astype(str).unique().tolist(), reverse=True)
+        selected_season = st.selectbox("📆 选择联赛赛季", options=seasons, index=0)
+        s_df = all_cwl[all_cwl["season"].astype(str) == selected_season].copy()
+
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            cwl_only_miss = st.checkbox("仅看有漏刀成员", value=False, key="cwl_only_miss")
+        with col_c2:
+            cwl_under_8 = st.checkbox("筛选未满 8 星成员", value=False, key="cwl_under_8")
+
+        day_lookup = {}
+        for _, r in s_df.iterrows():
+            key = (r["player_tag"], int(r["round_num"]))
+            if int(r["attacks_used"]) > 0:
+                day_lookup[key] = f"{int(r['stars'])}★"
+            elif str(r["war_state"]) == "warEnded":
+                day_lookup[key] = "❌漏"
+            else:
+                day_lookup[key] = "⏳待"
+
+        cwl_grouped = (
+            s_df.groupby(["player_tag", "player_name"], as_index=False)
+            .agg(
+                大本营=("town_hall", "max"),
+                上场天数=("round_num", "nunique"),
+                已出刀=("attacks_used", "sum"),
+                漏打刀数=("attacks_missed", "sum"),
+                总得星=("stars", "sum"),
             )
-            cp_sorted = cp_raw.sort_values(by=["Missed", "漏刀率(%)"], ascending=[False, False]).reset_index(drop=True)
-            cp_sorted = cp_sorted.rename(
-                columns={
-                    "Name": "成员名称",
-                    "Tag": "玩家标签",
-                    "Wars Participated": "参战场次",
-                    "Number of Attacks": "实际出刀",
-                    "Missed": "漏打刀数",
-                    "Total Stars": "总得星",
-                    "Avg. Stars": "刀均得星",
-                }
-            )
+        )
 
-            render_kpi_grid([
-                ("收录人数", f"{len(cp_sorted)} 人", ""),
-                ("全勤人数", f"{int((cp_sorted['漏打刀数'] == 0).sum())} 人", "ok"),
-                ("漏打人数", f"{int((cp_sorted['漏打刀数'] > 0).sum())} 人", "alert"),
-                ("累计漏刀", f"{int(cp_sorted['漏打刀数'].sum())} 刀", "alert"),
-            ])
+        ended_missed_map = (
+            s_df[s_df["war_state"] == "warEnded"]
+            .groupby("player_tag")["attacks_missed"]
+            .sum()
+            .to_dict()
+        )
+        cwl_grouped["确认漏刀"] = cwl_grouped["player_tag"].map(lambda t: int(ended_missed_map.get(t, 0)))
 
-            cp_view = cp_sorted[cp_sorted["漏打刀数"] > 0] if cp_only_miss else cp_sorted
-            cp_compact = ["状态", "成员名称", "出勤", "漏打刀数", "漏刀率(%)"]
-            cp_detail = ["状态", "成员名称", "参战场次", "出勤", "漏打刀数", "漏刀率(%)", "总得星", "刀均得星"]
-            cp_cols = cp_detail if cp_full_cols else cp_compact
+        for d in range(1, 8):
+            cwl_grouped[f"D{d}"] = cwl_grouped["player_tag"].map(lambda t: day_lookup.get((t, d), "—"))
 
-            def style_cp(r):
-                s = str(r["状态"])
-                if "严重" in s:
-                    return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
-                elif "漏打" in s:
-                    return ["background-color: #FCF3CF; color: #7D6608; font-weight: bold"] * len(r)
-                return ["background-color: #E8F8F5; color: #0E6251"] + [""] * (len(r) - 1)
+        def tag_cwl_status(r):
+            if r["确认漏刀"] > 0:
+                return f"🔴 漏{r['确认漏刀']}刀"
+            elif r["总得星"] >= 8:
+                return "⭐ 满8星"
+            return "🟢 未满8星"
 
-            cp_fmt = {"漏刀率(%)": "{:.1f}%"}
-            if cp_full_cols:
-                cp_fmt["刀均得星"] = "{:.2f}"
+        cwl_grouped["状态"] = cwl_grouped.apply(tag_cwl_status, axis=1)
+        cwl_grouped["出勤"] = cwl_grouped.apply(lambda r: f"{r['已出刀']}/{r['上场天数']}", axis=1)
+        cwl_grouped = cwl_grouped.sort_values(
+            by=["确认漏刀", "总得星", "上场天数"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+        cwl_grouped = cwl_grouped.rename(columns={"player_name": "成员名称", "player_tag": "玩家标签"})
 
-            st.dataframe(
-                cp_view[cp_cols].style.apply(style_cp, axis=1).format(cp_fmt),
-                use_container_width=True,
-                height=480,
-                hide_index=True,
-            )
+        recorded_days = int(s_df["round_num"].max())
+        render_kpi_grid([
+            ("联赛进度", f"已录 {recorded_days}/7 天", ""),
+            ("参战人数", f"{len(cwl_grouped)} 人", ""),
+            ("已满 8 星", f"{int((cwl_grouped['总得星'] >= 8).sum())} 人", "ok"),
+            ("确认漏刀", f"{int(cwl_grouped['确认漏刀'].sum())} 刀", "alert"),
+        ])
 
-            st.download_button(
-                label=f"⬇️ 下载 {ACTIVE_NAME} 出勤表 (.xlsx)",
-                data=build_excel_bytes(cp_view[cp_detail], f"{ACTIVE_NAME}统计"),
-                file_name=f"{ACTIVE_NAME}_部落战出勤统计.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"加载 Google Sheet 失败：{e}")
+        cwl_view = cwl_grouped.copy()
+        if cwl_only_miss:
+            cwl_view = cwl_view[cwl_view["确认漏刀"] > 0]
+        if cwl_under_8:
+            cwl_view = cwl_view[cwl_view["总得星"] < 8]
+
+        cwl_cols = ["状态", "成员名称", "出勤", "总得星", "D1", "D2", "D3", "D4", "D5", "D6", "D7"]
+
+        def style_cwl(r):
+            s = str(r["状态"])
+            if "🔴" in s:
+                return ["background-color: #FADBD8; color: #78281F; font-weight: bold"] * len(r)
+            elif "⭐" in s:
+                return ["background-color: #E8F8F5; color: #0E6251; font-weight: bold"] + [""] * (len(r) - 1)
+            return ["background-color: #FCF3CF; color: #7D6608"] + [""] * (len(r) - 1)
+
+        st.dataframe(
+            cwl_view[cwl_cols].style.apply(style_cwl, axis=1),
+            use_container_width=True,
+            height=480,
+            hide_index=True,
+        )
+        st.caption("图例：`3★` 得星数 ｜ `❌漏` 已结束未出刀 ｜ `⏳待` 当天战斗日进行中 ｜ `—` 当天未上场轮休")
+
+        st.download_button(
+            label=f"⬇️ 下载 {ACTIVE_NAME} ({selected_season}) 七天联赛表 (.xlsx)",
+            data=build_excel_bytes(cwl_view[cwl_cols], f"{ACTIVE_NAME}联赛_{selected_season}"),
+            file_name=f"{ACTIVE_NAME}_{selected_season}_七天联赛统计.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        miss_cwl = cwl_grouped[cwl_grouped["确认漏刀"] > 0]
+        eight_cwl = cwl_grouped[cwl_grouped["总得星"] >= 8]
+        under8_cwl = cwl_grouped[(cwl_grouped["总得星"] < 8) & (cwl_grouped["确认漏刀"] == 0)]
+
+        cwl_msg = [
+            f"【{ACTIVE_NAME} {selected_season} 联赛战况通报（第 {recorded_days}/7 天）】",
+            "",
+            "🔴 联赛漏刀名单（按规撤下）：",
+        ]
+        if miss_cwl.empty:
+            cwl_msg.append("- 暂无漏刀，全员出勤！")
+        else:
+            for _, r in miss_cwl.iterrows():
+                cwl_msg.append(f"- {r['成员名称']}：漏 {r['确认漏刀']} 刀（当前 {r['总得星']}★，出勤 {r['出勤']}）")
+
+        cwl_msg.append("")
+        cwl_msg.append(f"⭐ 已满 8 星成员（共 {len(eight_cwl)} 人，可安排轮换）：")
+        if eight_cwl.empty:
+            cwl_msg.append("- 暂无")
+        else:
+            cwl_msg.append("、".join(f"{r['成员名称']}({r['总得星']}★)" for _, r in eight_cwl.iterrows()))
+
+        cwl_msg.append("")
+        cwl_msg.append(f"🟡 尚差星数满 8 星（共 {len(under8_cwl)} 人，优先安排上场）：")
+        if under8_cwl.empty:
+            cwl_msg.append("- 暂无")
+        else:
+            cwl_msg.append("、".join(f"{r['成员名称']}({r['总得星']}★)" for _, r in under8_cwl.iterrows()))
+
+        st.markdown("**📢 一键复制联赛轮换与漏刀通报**")
+        st.code("\n".join(cwl_msg), language="text")
