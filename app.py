@@ -418,12 +418,16 @@ with tab_history:
             total_recorded = len(unique_wars)
             default_n = min(15, total_recorded)
 
-            last_n = st.slider(
-                f"统计最近几场（{ACTIVE_NAME} 已归档 {total_recorded} 场）",
-                min_value=1,
-                max_value=max(1, total_recorded),
-                value=default_n,
-            )
+            if total_recorded <= 1:
+             last_n = 1
+             st.caption(f"📌 当前 {ACTIVE_NAME} 已归档 1 场部落战（积累 2 场及以上后可滑动选择场次范围）")
+         else:
+             last_n = st.slider(
+                 f"统计最近几场（{ACTIVE_NAME} 已归档 {total_recorded} 场）",
+                 min_value=1,
+                 max_value=total_recorded,
+                 value=default_n,
+             )
 
             col_f1, col_f2 = st.columns(2)
             with col_f1:
