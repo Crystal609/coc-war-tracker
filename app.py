@@ -47,11 +47,15 @@ st.markdown(
     .clan-header {
         background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
         color: #ffffff;
-        padding: 13px 16px;
+        padding: 12px 16px;
         border-radius: 12px;
         margin-top: 6px;
         margin-bottom: 12px;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
     }
     .clan-title {
         font-size: 1.18rem;
@@ -59,11 +63,6 @@ st.markdown(
         line-height: 1.35;
         margin: 0;
         word-break: break-word;
-    }
-    .clan-sub {
-        font-size: 0.78rem;
-        color: #cbd5e1;
-        margin-top: 3px;
     }
     .kpi-grid {
         display: grid;
@@ -135,6 +134,13 @@ def get_secret_val(key_name: str) -> str:
     except Exception:
         pass
     return os.getenv(key_name, "").strip()
+
+
+def format_season_label(s: str) -> str:
+    m = re.match(r"^(\d{4})-(\d{1,2})", str(s).strip())
+    if m:
+        return f"{m.group(1)} {int(m.group(2))}月"
+    return str(s)
 
 
 def parse_coc_time(ts: str):
@@ -293,16 +299,17 @@ ACTIVE_NAME = selected_clan["name"]
 ACTIVE_TAG = selected_clan["tag"].strip().upper()
 BACKUP_SHEET_ID = get_secret_val("GOOGLE_SHEET_ID")
 
-header_extra = ""
-if BACKUP_SHEET_ID:
-    sheet_url = f"https://docs.google.com/spreadsheets/d/{BACKUP_SHEET_ID}/edit"
-    header_extra = f' · <a href="{sheet_url}" target="_blank" style="color:#38bdf8;text-decoration:none;">📊 打开云端Sheet备份</a>'
+sheet_badge = (
+    f'<a href="https://docs.google.com/spreadsheets/d/{BACKUP_SHEET_ID}/edit" target="_blank" '
+    f'style="color:#38bdf8;font-size:0.8rem;text-decoration:none;white-space:nowrap;">📊 云端备份</a>'
+    if BACKUP_SHEET_ID else ""
+)
 
 st.markdown(
     f"""
     <div class="clan-header">
         <div class="clan-title">⚔️ {ACTIVE_NAME} ({ACTIVE_TAG})</div>
-        <div class="clan-sub">每30分钟全自动抓拍归档 · 三部落独立统计{header_extra}</div>
+        {sheet_badge}
     </div>
     """,
     unsafe_allow_html=True,
@@ -586,7 +593,13 @@ with tab_cwl:
         all_cwl = all_cwl.drop_duplicates(subset=["season", "round_num", "player_tag"], keep="last")
 
         seasons = sorted(all_cwl["season"].astype(str).unique().tolist(), reverse=True)
-        selected_season = st.selectbox("📆 选择联赛赛季", options=seasons, index=0)
+        selected_season = st.selectbox(
+            "📆 选择联赛赛季",
+            options=seasons,
+            index=0,
+            format_func=format_season_label,
+        )
+        season_label = format_season_label(selected_season)
         s_df = all_cwl[all_cwl["season"].astype(str) == selected_season].copy()
 
         col_c1, col_c2 = st.columns(2)
@@ -675,9 +688,9 @@ with tab_cwl:
         st.caption("图例：`3★` 得星数 ｜ `❌漏` 已结束未出刀 ｜ `⏳待` 当天战斗日进行中 ｜ `—` 当天未上场轮休")
 
         st.download_button(
-            label=f"⬇️ 下载 {ACTIVE_NAME} ({selected_season}) 七天联赛表 (.xlsx)",
-            data=build_excel_bytes(cwl_view[cwl_cols], f"{ACTIVE_NAME}联赛_{selected_season}"),
-            file_name=f"{ACTIVE_NAME}_{selected_season}_七天联赛统计.xlsx",
+            label=f"⬇️ 下载 {ACTIVE_NAME} ({season_label}) 七天联赛表 (.xlsx)",
+            data=build_excel_bytes(cwl_view[cwl_cols], f"{ACTIVE_NAME}_{season_label.replace(' ', '_')}"),
+            file_name=f"{ACTIVE_NAME}_{season_label.replace(' ', '_')}_七天联赛统计.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
@@ -687,7 +700,7 @@ with tab_cwl:
         under8_cwl = cwl_grouped[(cwl_grouped["总得星"] < 8) & (cwl_grouped["确认漏刀"] == 0)]
 
         cwl_msg = [
-            f"【{ACTIVE_NAME} {selected_season} 联赛战况通报（第 {recorded_days}/7 天）】",
+            f"【{ACTIVE_NAME} {season_label} 联赛战况通报（第 {recorded_days}/7 天）】",
             "",
             "🔴 联赛漏刀名单（按规撤下）：",
         ]
