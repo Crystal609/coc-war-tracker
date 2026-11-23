@@ -11,47 +11,73 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(
-    page_title="萌面打劫 | 部落战监控",
+    page_title="部落战监控台 | 三部落联动",
     page_icon="⚔️",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-CLAN_TAG = "#2YR9JVCG8"
+# 在这里配置你的三个部落（把第三个部落的 #TAG 替换成游戏里的实际标签即可）
+CLANS = [
+    {
+        "name": "萌面打劫",
+        "tag": "#2YR9JVCG8",
+        "default_sheet": "https://docs.google.com/spreadsheets/d/1GYL8qHNSyG8rGXycw_mbYIy-BuCpxlYPfYH7aYTvwPg/edit?gid=0#gid=0",
+    },
+    {
+        "name": "萌虎下山",
+        "tag": "#2JLC9Q8LL",
+        "default_sheet": "",
+    },
+    {
+        "name": "小倔强",
+        "tag": "#2CVRYQ9C",
+        "default_sheet": "",
+    },
+]
+
 API_BASE = "https://cocproxy.royaleapi.dev/v1"
 HISTORY_FILE = "war_history.csv"
-DEFAULT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1GYL8qHNSyG8rGXycw_mbYIy-BuCpxlYPfYH7aYTvwPg/edit?gid=0#gid=0"
 
-# 手机端响应式自适应 CSS 优化
 st.markdown(
     """
     <style>
+    /* 修复顶部留白，避免被 Streamlit 顶部工具栏遮挡 */
     .block-container {
-        padding-top: 1.2rem !important;
-        padding-bottom: 2rem !important;
-        padding-left: 0.85rem !important;
-        padding-right: 0.85rem !important;
+        padding-top: 3.4rem !important;
+        padding-bottom: 2.2rem !important;
+        padding-left: 0.9rem !important;
+        padding-right: 0.9rem !important;
         max-width: 820px;
+    }
+    /* 顶部部落横向切换按钮美化 */
+    div[data-testid="stRadio"] > div {
+        background: #f1f5f9;
+        padding: 6px 10px;
+        border-radius: 10px;
+        border: 1px solid #cbd5e1;
+        gap: 12px;
     }
     .clan-header {
         background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
         color: #ffffff;
-        padding: 14px 16px;
+        padding: 13px 16px;
         border-radius: 12px;
+        margin-top: 6px;
         margin-bottom: 12px;
         box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
     }
     .clan-title {
-        font-size: 1.22rem;
+        font-size: 1.18rem;
         font-weight: 700;
         line-height: 1.35;
         margin: 0;
         word-break: break-word;
     }
     .clan-sub {
-        font-size: 0.8rem;
+        font-size: 0.78rem;
         color: #cbd5e1;
-        margin-top: 4px;
+        margin-top: 3px;
     }
     .kpi-grid {
         display: grid;
@@ -68,7 +94,7 @@ st.markdown(
         background: #f8fafc;
         border: 1px solid #e2e8f0;
         border-radius: 10px;
-        padding: 10px 12px;
+        padding: 9px 12px;
     }
     .kpi-card.alert {
         background: #fef2f2;
@@ -84,7 +110,7 @@ st.markdown(
         margin-bottom: 2px;
     }
     .kpi-val {
-        font-size: 1.15rem;
+        font-size: 1.12rem;
         font-weight: 700;
         color: #0f172a;
     }
@@ -95,7 +121,7 @@ st.markdown(
         color: #15803d;
     }
     button[data-baseweb="tab"] {
-        font-size: 0.88rem !important;
+        font-size: 0.9rem !important;
         padding-left: 10px !important;
         padding-right: 10px !important;
     }
@@ -198,7 +224,7 @@ def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> by
         excel_r = r_idx + 2
         status_val = str(row.get("状态", row.get("出勤状态", "")))
         is_severe = "严重" in status_val or "0刀" in status_val
-        is_minor = "一般" in status_val or "差1刀" in status_val
+        is_minor = "漏打" in status_val or "差1刀" in status_val
 
         row_fill = severe_fill if is_severe else (minor_fill if is_minor else (zebra_fill if r_idx % 2 == 1 else white_fill))
         row_font = font_severe if is_severe else (font_minor if is_minor else font_data)
@@ -224,10 +250,31 @@ def build_excel_bytes(df: pd.DataFrame, sheet_title: str = "漏打统计") -> by
     return buf.getvalue()
 
 
+# ==================== 顶部一键切换部落（横向按钮，手机一点即切） ====================
+clan_names = [c["name"] for c in CLANS]
+selected_name = st.radio(
+    "🏰 点击切换部落：",
+    options=clan_names,
+    horizontal=True,
+)
+selected_clan = next(c for c in CLANS if c["name"] == selected_name)
+ACTIVE_NAME = selected_clan["name"]
+ACTIVE_TAG = selected_clan["tag"].strip().upper()
+ACTIVE_SHEET = selected_clan["default_sheet"]
+
+# 如果第3个部落还没在代码里改标签，支持直接在网页临时输入查看
+if "第" in ACTIVE_TAG or "TAG" in ACTIVE_TAG:
+    custom_tag = st.text_input(
+        f"输入 {ACTIVE_NAME} 的部落标签（例如 #2PP0J9L8）即可立即查看：",
+        placeholder="#XXXXXXXX",
+    ).strip().upper()
+    if custom_tag:
+        ACTIVE_TAG = custom_tag if custom_tag.startswith("#") else f"#{custom_tag}"
+
 st.markdown(
-    """
+    f"""
     <div class="clan-header">
-        <div class="clan-title">⚔️ 萌面打劫 (#2YR9JVCG8) 部落战监控</div>
+        <div class="clan-title">⚔️ {ACTIVE_NAME} ({ACTIVE_TAG})</div>
         <div class="clan-sub">实时催刀 · 自动归档历史 · 漏打红黄高亮</div>
     </div>
     """,
@@ -244,12 +291,14 @@ with tab_live:
     token = get_api_token()
     if not token:
         st.warning("尚未检测到 `COC_API_TOKEN`，请在 Streamlit App 设置的 Secrets 中填入官方 Token。")
+    elif "第" in ACTIVE_TAG or "TAG" in ACTIVE_TAG:
+        st.info(f"请在上方输入框填写 **{ACTIVE_NAME}** 的 `#TAG`（同时建议写入 `app.py` 和 `fetch_war.py` 永久保存）。")
     else:
         if st.button("🔄 刷新实时战况", use_container_width=True):
             st.cache_data.clear()
 
         try:
-            war = fetch_live_war(CLAN_TAG, token)
+            war = fetch_live_war(ACTIVE_TAG, token)
             state = war.get("state", "notInWar")
             state_map = {
                 "notInWar": "⚪ 当前未开战",
@@ -260,7 +309,7 @@ with tab_live:
             st.markdown(f"**当前状态：{state_map.get(state, state)}**")
 
             if state == "notInWar":
-                st.info("部落目前没有正在进行的常规部落战。开战后点刷新即可实时查看未出刀名单。")
+                st.info(f"**{ACTIVE_NAME}** 目前没有正在进行的常规部落战。开战后点刷新即可实时查看未出刀名单。")
             else:
                 clan_info = war.get("clan", {})
                 opp_info = war.get("opponent", {})
@@ -306,7 +355,6 @@ with tab_live:
                         "出刀": f"{used}/{atk_limit}",
                         "剩余": rem,
                         "得星": stars,
-                        "大本": m.get("townhallLevel", 0),
                     })
 
                 live_df = pd.DataFrame(live_rows)
@@ -336,7 +384,7 @@ with tab_live:
                 if state == "inWar" and (not zero_df.empty or not one_df.empty):
                     st.markdown("**📢 一键复制实时催刀通知**")
                     txt_lines = [
-                        f"【萌面打劫 部落战催刀】剩余 {remain_str}",
+                        f"【{ACTIVE_NAME} 部落战催刀】剩余 {remain_str}",
                         f"比分：{clan_info.get('stars', 0)}★ vs {opp_info.get('stars', 0)}★",
                         "",
                     ]
@@ -354,22 +402,24 @@ with tab_live:
 with tab_history:
     if not os.path.exists(HISTORY_FILE):
         st.info(
-            "💡 **为什么这里目前是空的？**\n\n"
-            "本页数据来自仓库里的 `war_history.csv`（由 GitHub Actions 每 30 分钟抓拍官方接口自动生成）。\n"
-            "1. 请先去 GitHub 仓库的 **Actions** 页面点击 **Run workflow** 手动触发首次同步；\n"
-            "2. 官方接口仅记录从配置后开始的新场次，在自动攒够 15 场之前，请先点右侧 **「📁 表格导入」** 查看已有的 14 场历史汇总。"
+            "💡 `war_history.csv` 尚未生成。请先去 GitHub 仓库的 **Actions** 页面点击 **Run workflow** 手动触发一次同步。"
         )
     else:
-        hist_df = pd.read_csv(HISTORY_FILE)
+        raw_hist = pd.read_csv(HISTORY_FILE)
+        if "clan_tag" not in raw_hist.columns:
+            raw_hist["clan_tag"] = "#2YR9JVCG8"
+
+        hist_df = raw_hist[raw_hist["clan_tag"].astype(str).str.upper() == ACTIVE_TAG].copy()
+
         if hist_df.empty:
-            st.info("`war_history.csv` 已创建，但当前部落尚未处于战斗日。开战后系统会自动录入每一场数据。")
+            st.info(f"**{ACTIVE_NAME} ({ACTIVE_TAG})** 暂无自动归档记录。开战并由 GitHub Actions 抓拍后会自动显示在此处。")
         else:
             unique_wars = sorted(hist_df["war_id"].astype(str).unique().tolist())
             total_recorded = len(unique_wars)
             default_n = min(15, total_recorded)
 
             last_n = st.slider(
-                f"统计最近几场（已自动归档 {total_recorded} 场）",
+                f"统计最近几场（{ACTIVE_NAME} 已归档 {total_recorded} 场）",
                 min_value=1,
                 max_value=max(1, total_recorded),
                 value=default_n,
@@ -455,9 +505,9 @@ with tab_history:
             )
 
             st.download_button(
-                label=f"⬇️ 下载最近{len(target_war_ids)}场出勤表 (.xlsx)",
-                data=build_excel_bytes(view_hist[detail_cols], f"最近{len(target_war_ids)}场统计"),
-                file_name=f"萌面打劫_最近{len(target_war_ids)}场出勤统计.xlsx",
+                label=f"⬇️ 下载 {ACTIVE_NAME} 出勤表 (.xlsx)",
+                data=build_excel_bytes(view_hist[detail_cols], f"{ACTIVE_NAME}统计"),
+                file_name=f"{ACTIVE_NAME}_最近{len(target_war_ids)}场出勤统计.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
@@ -465,7 +515,7 @@ with tab_history:
             sev = grouped[grouped["状态"].str.contains("严重")]
             min_l = grouped[grouped["状态"].str.contains("漏打")]
             msg = [
-                f"【萌面打劫 近{len(target_war_ids)}场部落战通报】",
+                f"【{ACTIVE_NAME} 近{len(target_war_ids)}场部落战通报】",
                 f"全勤 {int((grouped['漏打刀数'] == 0).sum())} 人 | 漏打 {int((grouped['漏打刀数'] > 0).sum())} 人（共漏 {int(grouped['漏打刀数'].sum())} 刀）",
                 "",
                 "🔴 严重漏打 / 全鸽名单：",
@@ -480,14 +530,20 @@ with tab_history:
             st.code("\n".join(msg), language="text")
 
 with tab_clashperk:
-    gs_url = st.text_input("ClashPerk Google Sheet 链接", value=DEFAULT_SHEET_URL)
+    gs_url = st.text_input(
+        f"粘贴 {ACTIVE_NAME} 的 ClashPerk Google Sheet 链接",
+        value=ACTIVE_SHEET,
+        key=f"gs_input_{ACTIVE_TAG}",
+    )
     col_cp1, col_cp2 = st.columns(2)
     with col_cp1:
         cp_only_miss = st.checkbox("仅看漏打成员", value=False, key="cp_only_miss")
     with col_cp2:
         cp_full_cols = st.checkbox("展开详细星数列", value=False, key="cp_full_cols")
 
-    if gs_url:
+    if not gs_url:
+        st.info(f"在 Discord 对 **{ACTIVE_NAME}** 执行 `/export wars` 后，把生成的 Google Sheet 链接贴到上方即可查看。")
+    else:
         try:
             cp_raw = load_gsheet(gs_url).dropna(subset=["Name"]).copy()
             cp_raw["Wars Participated"] = cp_raw["Wars Participated"].astype(int)
@@ -547,9 +603,9 @@ with tab_clashperk:
             )
 
             st.download_button(
-                label="⬇️ 下载高亮统计表 (.xlsx)",
-                data=build_excel_bytes(cp_view[cp_detail], "ClashPerk统计"),
-                file_name="萌面打劫_部落战出勤统计.xlsx",
+                label=f"⬇️ 下载 {ACTIVE_NAME} 出勤表 (.xlsx)",
+                data=build_excel_bytes(cp_view[cp_detail], f"{ACTIVE_NAME}统计"),
+                file_name=f"{ACTIVE_NAME}_部落战出勤统计.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
