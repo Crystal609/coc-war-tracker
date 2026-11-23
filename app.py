@@ -311,38 +311,52 @@ with tab_live:
                 st.dataframe(df_live_show, use_container_width=True, hide_index=True)
 
 # ==========================================
-# Tab 2: 常规战归档
+# Tab 2: 常规战归档（优化：支持下拉选择统计多少场比赛）
 # ==========================================
 with tab_war:
     if war_df.empty:
         st.info("暂无常规战归档记录，等待 GitHub Actions 自动抓拍后即可查看。")
     else:
-        col_w1, col_w2 = st.columns([2, 2])
+        col_w1, col_w2 = st.columns(2)
         with col_w1:
             clan_opts_w = ["全部部落"] + [f"{c['name']} ({c['tag']})" for c in CLANS]
             sel_w_clan = st.selectbox("筛选部落", clan_opts_w, key="war_arch_clan")
+
+        range_map = {
+            "近 5 场": 5,
+            "近 10 场": 10,
+            "近 15 场": 15,
+            "近 30 场": 30,
+            "近 50 场": 50,
+            "全部已归档场次": None,
+        }
+        with col_w2:
+            sel_range_label = st.selectbox(
+                "统计场次范围",
+                options=list(range_map.keys()),
+                index=2,  # 默认选中「近 15 场」
+                key="war_range_select",
+            )
+
         sub_war = war_df.copy()
         if sel_w_clan != "全部部落":
             target_tag = sel_w_clan.split("(")[-1].rstrip(")")
             sub_war = sub_war[sub_war["clan_tag"].astype(str) == target_tag]
 
-        unique_wars = sorted(sub_war["war_id"].astype(str).unique().tolist())
-        total_wars_cnt = max(1, len(unique_wars))
-        with col_w2:
-            if total_wars_cnt > 1:
-                recent_n_wars = st.slider(
-                    "统计最近场次",
-                    min_value=1,
-                    max_value=total_wars_cnt,
-                    value=min(15, total_wars_cnt),
-                    key="war_recent_slider",
-                )
-            else:
-                recent_n_wars = 1
-                st.caption("当前已归档 1 场常规战")
+        total_wars_cnt = int(sub_war["war_id"].astype(str).nunique())
+        target_n = range_map[sel_range_label]
 
-        keep_war_ids = unique_wars[-recent_n_wars:]
-        sub_war_recent = sub_war[sub_war["war_id"].astype(str).isin(keep_war_ids)]
+        if target_n is None:
+            sub_war_recent = sub_war.copy()
+            title_text = f"全部已归档常规战考勤汇总（当前共 {total_wars_cnt} 场）"
+        else:
+            # 按每个部落各自取最近 target_n 场，全部部落合并时更公平
+            kept_parts = []
+            for _, grp_clan in sub_war.groupby("clan_tag"):
+                c_wars = sorted(grp_clan["war_id"].astype(str).unique().tolist())[-target_n:]
+                kept_parts.append(grp_clan[grp_clan["war_id"].astype(str).isin(c_wars)])
+            sub_war_recent = pd.concat(kept_parts, ignore_index=True) if kept_parts else sub_war.copy()
+            title_text = f"{sel_range_label}常规战考勤汇总（当前已归档 {total_wars_cnt} 场）"
 
         if not sub_war_recent.empty:
             summary_w = (
@@ -359,20 +373,43 @@ with tab_war:
             )
             summary_w["漏刀率(%)"] = (summary_w["漏刀"] / summary_w["应出刀"].replace(0, 1) * 100).round(1)
             summary_w = summary_w.sort_values(by=["漏刀", "漏刀率(%)", "总星"], ascending=[False, False, False])
-            st.subheader(f"近 {len(keep_war_ids)} 场常规战考勤汇总")
+            summary_w = summary_w.rename(
+                columns={
+                    "clan_name": "所属部落",
+                    "player_tag": "玩家标签",
+                    "player_name": "成员名称",
+                }
+            )
+            st.subheader(title_text)
             st.dataframe(summary_w, use_container_width=True, hide_index=True)
 
             with st.expander("查看逐场原始出刀明细", expanded=False):
                 detail_w = sub_war_recent.copy()
                 detail_w["日期"] = detail_w["start_time"].apply(format_date_str)
+                detail_w = detail_w.rename(
+                    columns={
+                        "clan_name": "所属部落",
+                        "opponent_name": "对手部落",
+                        "map_position": "顺位",
+                        "player_name": "成员名称",
+                        "player_tag": "玩家标签",
+                        "town_hall": "大本",
+                        "attacks_used": "实出刀",
+                        "attacks_missed": "漏刀",
+                        "total_stars": "得星",
+                        "three_stars": "三星数",
+                        "total_destruction": "总摧毁(%)",
+                        "war_state": "状态",
+                    }
+                )
                 cols_show = [
-                    "日期", "clan_name", "opponent_name", "map_position",
-                    "player_name", "player_tag", "town_hall", "attacks_used",
-                    "attacks_missed", "total_stars", "three_stars", "total_destruction", "war_state"
+                    "日期", "所属部落", "对手部落", "顺位",
+                    "成员名称", "玩家标签", "大本", "实出刀",
+                    "漏刀", "得星", "三星数", "总摧毁(%)", "状态"
                 ]
                 cols_show = [c for c in cols_show if c in detail_w.columns]
                 st.dataframe(
-                    detail_w.sort_values(by=["war_id", "clan_tag", "map_position"], ascending=[False, True, True])[cols_show],
+                    detail_w.sort_values(by=["war_id", "clan_tag", "顺位"], ascending=[False, True, True])[cols_show],
                     use_container_width=True,
                     hide_index=True,
                 )
