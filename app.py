@@ -40,6 +40,13 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 
+def normalize_tag(tag: str) -> str:
+    t = str(tag or "").strip().upper().replace("O", "0")
+    if t and not t.startswith("#"):
+        t = "#" + t
+    return t
+
+
 def get_secret(key: str, default: str = "") -> str:
     try:
         if key in st.secrets:
@@ -80,11 +87,10 @@ def load_csv_safe(filepath: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=120)
-def fetch_live_war(clan_tag: str, token: str) -> dict | None:
+def api_get_cached(path: str, token: str) -> tuple[int, dict | None]:
     if not token:
-        return None
-    enc = urllib.parse.quote(clan_tag)
-    url = f"{API_BASE}/clans/{enc}/currentwar"
+        return 0, None
+    url = f"{API_BASE}{path}"
     try:
         resp = requests.get(
             url,
@@ -92,10 +98,144 @@ def fetch_live_war(clan_tag: str, token: str) -> dict | None:
             timeout=15,
         )
         if resp.status_code == 200:
-            return resp.json()
+            return 200, resp.json()
+        return resp.status_code, None
     except Exception:
-        return None
-    return None
+        return -1, None
+
+
+def fetch_live_war(clan_tag: str, token: str) -> dict | None:
+    enc = urllib.parse.quote(clan_tag)
+    code, data = api_get_cached(f"/clans/{enc}/currentwar", token)
+    return data if code == 200 else None
+
+
+def fetch_external_player_live(player_tag: str, token: str) -> dict:
+    """实时查询任意玩家档案及其当前所在外部部落的常规战与七天联赛"""
+    clean_tag = normalize_tag(player_tag)
+    if not clean_tag or len(clean_tag) < 4:
+        return {"error": "请输入有效的玩家标签（例如 #P8QGLU980）。"}
+    if not token:
+        return {"error": "未配置 COC_API_TOKEN，无法进行实时跨部落接口查询。"}
+
+    enc_p = urllib.parse.quote(clean_tag)
+    code, pdata = api_get_cached(f"/players/{enc_p}", token)
+    if code == 404 or not pdata:
+        return {"error": f"未找到玩家 `{clean_tag}`，请检查标签是否拼写正确（注意数字 0 与字母 O）。"}
+    if code != 200:
+        return {"error": f"查询失败（HTTP {code}），请稍后重试。"}
+
+    # 提取成就中的生涯联赛星数与部落战星数
+    war_hero_stars = 0
+    cwl_legend_stars = 0
+    for ach in pdata.get("achievements", []) or []:
+        aname = ach.get("name", "")
+        if aname == "War Hero":
+            war_hero_stars = safe_int(ach.get("value", 0))
+        elif aname == "War League Legend":
+            cwl_legend_stars = safe_int(ach.get("value", 0))
+
+    clan_info = pdata.get("clan") or {}
+    cur_clan_tag = clan_info.get("tag", "")
+    cur_clan_name = clan_info.get("name", "无部落")
+
+    ext_war_rows = []
+    ext_cwl_rows = []
+    ext_war_note = ""
+    ext_cwl_note = ""
+
+    if cur_clan_tag:
+        enc_c = urllib.parse.quote(cur_clan_tag)
+        # 1. 查该外部部落当前常规战
+        w_code, w_data = api_get_cached(f"/clans/{enc_c}/currentwar", token)
+        if w_code == 403:
+            ext_war_note = f"该玩家当前所在部落 **{cur_clan_name}** 隐藏了对战日志，无法读取常规战明细。"
+        elif w_code == 200 and w_data and w_data.get("state") in ("preparation", "inWar", "warEnded"):
+            st_map = {"preparation": "准备日", "inWar": "进行中", "warEnded": "已结束"}
+            opp_name = w_data.get("opponent", {}).get("name", "未知对手")
+            atk_lim = safe_int(w_data.get("attacksPerMember", 2), 2)
+            for m in w_data.get("clan", {}).get("members", []):
+                if normalize_tag(m.get("tag", "")) == clean_tag:
+                    atks = m.get("attacks", []) or []
+                    used = len(atks)
+                    ext_war_rows.append({
+                        "日期/赛季": f"{format_date_str(w_data.get('startTime', ''))} (当前)",
+                        "赛事类型": "外部常规战",
+                        "所属部落": cur_clan_name,
+                        "对手部落": opp_name,
+                        "顺位": f"#{safe_int(m.get('mapPosition', 0))}",
+                        "大本": safe_int(m.get("townhallLevel", 0)),
+                        "出刀情况": f"{used} / {atk_lim}",
+                        "漏刀标记": f"❌ 漏{max(0, atk_lim - used)}刀" if (w_data.get("state") == "warEnded" and used < atk_lim) else ("⏳ 进行中" if used < atk_lim else "✅ 满刀"),
+                        "得星": sum(safe_int(a.get("stars", 0)) for a in atks),
+                        "三星数": sum(1 for a in atks if safe_int(a.get("stars", 0)) == 3),
+                        "总摧毁(%)": round(sum(safe_float(a.get("destructionPercentage", 0.0)) for a in atks), 1),
+                        "状态": st_map.get(w_data.get("state", ""), ""),
+                    })
+
+        # 2. 查该外部部落当前七天联赛
+        g_code, g_data = api_get_cached(f"/clans/{enc_c}/currentwar/leaguegroup", token)
+        if g_code == 403:
+            ext_cwl_note = f"该玩家当前所在部落 **{cur_clan_name}** 隐藏了联赛日志。"
+        elif g_code == 200 and g_data and g_data.get("state") != "notInWar":
+            season = str(g_data.get("season", ""))
+            for r_idx, rnd in enumerate(g_data.get("rounds", []), start=1):
+                for w_tag in rnd.get("warTags", []):
+                    if not w_tag or w_tag == "#0":
+                        continue
+                    enc_wt = urllib.parse.quote(w_tag)
+                    rw_code, rw_data = api_get_cached(f"/clanwarleagues/wars/{enc_wt}", token)
+                    if rw_code != 200 or not rw_data:
+                        continue
+                    c1 = rw_data.get("clan", {})
+                    c2 = rw_data.get("opponent", {})
+                    if normalize_tag(c1.get("tag", "")) == cur_clan_tag:
+                        our_c, opp_c = c1, c2
+                    elif normalize_tag(c2.get("tag", "")) == cur_clan_tag:
+                        our_c, opp_c = c2, c1
+                    else:
+                        continue
+
+                    w_st = rw_data.get("state", "")
+                    if w_st in ("inWar", "warEnded"):
+                        for m in our_c.get("members", []):
+                            if normalize_tag(m.get("tag", "")) == clean_tag:
+                                atks = m.get("attacks", []) or []
+                                used = len(atks)
+                                stars = sum(safe_int(a.get("stars", 0)) for a in atks)
+                                dest = sum(safe_float(a.get("destructionPercentage", 0.0)) for a in atks)
+                                ext_cwl_rows.append({
+                                    "日期/赛季": f"{format_month_cn(season)} · 第{r_idx}天",
+                                    "赛事类型": f"外部联赛 D{r_idx}",
+                                    "所属部落": cur_clan_name,
+                                    "对手部落": opp_c.get("name", "未知对手"),
+                                    "顺位": f"#{safe_int(m.get('mapPosition', 0))}",
+                                    "大本": safe_int(m.get("townhallLevel", 0)),
+                                    "出刀情况": f"{used} / 1",
+                                    "漏刀标记": "✅ 满刀" if used > 0 else ("❌ 漏1刀" if w_st == "warEnded" else "⏳ 待出刀"),
+                                    "得星": stars,
+                                    "三星数": 1 if (used > 0 and stars == 3) else 0,
+                                    "总摧毁(%)": round(dest, 1),
+                                    "状态": "进行中" if w_st == "inWar" else "已结束",
+                                })
+                    break
+
+    return {
+        "name": pdata.get("name", ""),
+        "tag": pdata.get("tag", clean_tag),
+        "town_hall": safe_int(pdata.get("townHallLevel", 0)),
+        "exp_level": safe_int(pdata.get("expLevel", 0)),
+        "clan_name": cur_clan_name,
+        "clan_tag": cur_clan_tag,
+        "war_pref": "参战 (绿牌)" if pdata.get("warPreference") == "in" else "免战 (红牌)",
+        "war_stars_total": safe_int(pdata.get("warStars", 0)),
+        "war_hero_stars": war_hero_stars,
+        "cwl_legend_stars": cwl_legend_stars,
+        "ext_war_rows": ext_war_rows,
+        "ext_cwl_rows": ext_cwl_rows,
+        "ext_war_note": ext_war_note,
+        "ext_cwl_note": ext_cwl_note,
+    }
 
 
 # 顶部简洁标题
@@ -319,12 +459,18 @@ with tab_cwl:
                 )
 
 # ==========================================
-# Tab 4: 👤 成员战绩查询（七天联赛隔壁的新窗口）
+# Tab 4: 👤 成员战绩查询（支持归档成员 + 任意 #标签跨部落搜索）
 # ==========================================
 with tab_member:
-    all_records = []
+    search_mode = st.radio(
+        "查询方式",
+        options=["📋 从本群归档成员中选择", "🔍 输入任意 #玩家标签 跨部落搜索（含外部部落）"],
+        horizontal=True,
+        key="member_search_mode",
+    )
 
-    # 1. 整合常规战记录
+    # 预先整合本地归档记录（三个部落的历史）
+    all_records = []
     if not war_df.empty:
         for _, r in war_df.iterrows():
             used = safe_int(r.get("attacks_used", 0))
@@ -343,7 +489,7 @@ with tab_member:
                 "所属部落": str(r.get("clan_name", "")),
                 "clan_tag": str(r.get("clan_tag", "")),
                 "对手部落": str(r.get("opponent_name", "")),
-                "player_tag": str(r.get("player_tag", "")),
+                "player_tag": normalize_tag(r.get("player_tag", "")),
                 "player_name": str(r.get("player_name", "")),
                 "大本": safe_int(r.get("town_hall", 0)),
                 "顺位": f"#{safe_int(r.get('map_position', 0))}",
@@ -358,7 +504,6 @@ with tab_member:
                 "状态": st_label,
             })
 
-    # 2. 整合七天联赛记录
     if not cwl_df.empty:
         for _, r in cwl_df.iterrows():
             used = safe_int(r.get("attacks_used", 0))
@@ -378,7 +523,7 @@ with tab_member:
                 "所属部落": str(r.get("clan_name", "")),
                 "clan_tag": str(r.get("clan_tag", "")),
                 "对手部落": str(r.get("opponent_name", "")),
-                "player_tag": str(r.get("player_tag", "")),
+                "player_tag": normalize_tag(r.get("player_tag", "")),
                 "player_name": str(r.get("player_name", "")),
                 "大本": safe_int(r.get("town_hall", 0)),
                 "顺位": f"#{safe_int(r.get('map_position', 0))}",
@@ -393,117 +538,180 @@ with tab_member:
                 "状态": st_label,
             })
 
-    if not all_records:
-        st.info("暂无成员战绩数据，等首次抓拍写入后即可在此查询任意成员的近期表现。")
-    else:
-        df_all_m = pd.DataFrame(all_records)
+    df_all_m = pd.DataFrame(all_records) if all_records else pd.DataFrame()
 
-        f_col1, f_col2, f_col3 = st.columns([1.3, 2.2, 1.5])
-        with f_col1:
-            m_clan_opts = ["全部部落"] + [f"{c['name']} ({c['tag']})" for c in CLANS]
-            sel_m_clan = st.selectbox("1. 筛选部落", m_clan_opts, key="member_clan_filter")
+    # ------------------------------------------
+    # 模式 A：从归档成员列表选择
+    # ------------------------------------------
+    if search_mode.startswith("📋"):
+        if df_all_m.empty:
+            st.info("暂无成员战绩数据，等首次抓拍写入后即可在此查询任意成员的近期表现。")
+        else:
+            f_col1, f_col2, f_col3 = st.columns([1.3, 2.2, 1.5])
+            with f_col1:
+                m_clan_opts = ["全部部落"] + [f"{c['name']} ({c['tag']})" for c in CLANS]
+                sel_m_clan = st.selectbox("1. 筛选部落", m_clan_opts, key="member_clan_filter")
 
-        df_filtered_clan = df_all_m.copy()
-        if sel_m_clan != "全部部落":
-            m_ctag = sel_m_clan.split("(")[-1].rstrip(")")
-            df_filtered_clan = df_filtered_clan[df_filtered_clan["clan_tag"] == m_ctag]
+            df_filtered_clan = df_all_m.copy()
+            if sel_m_clan != "全部部落":
+                m_ctag = sel_m_clan.split("(")[-1].rstrip(")")
+                df_filtered_clan = df_filtered_clan[df_filtered_clan["clan_tag"] == m_ctag]
 
-        # 按最新战绩去重生成可选成员列表（支持在下拉框内直接打字搜索名字或标签）
-        latest_players = (
-            df_filtered_clan.sort_values("sort_key", ascending=False)
-            .drop_duplicates(subset=["player_tag"])
-        )
-        player_options = []
-        tag_lookup = {}
-        for _, pr in latest_players.iterrows():
-            label = f"{pr['player_name']} ({pr['player_tag']}) · {pr['所属部落']} · {pr['大本']}本"
-            player_options.append(label)
-            tag_lookup[label] = pr["player_tag"]
-
-        with f_col2:
-            if not player_options:
-                st.warning("当前筛选部落下暂无成员记录。")
-                sel_player_label = None
-            else:
-                sel_player_label = st.selectbox(
-                    "2. 选择成员（可直接输入名字搜索）",
-                    options=player_options,
-                    key="member_player_select",
-                )
-
-        with f_col3:
-            mode_filter = st.selectbox(
-                "3. 赛事范围",
-                options=["全部战绩 (常规+联赛)", "仅常规战", "仅七天联赛"],
-                key="member_mode_filter",
+            latest_players = (
+                df_filtered_clan.sort_values("sort_key", ascending=False)
+                .drop_duplicates(subset=["player_tag"])
             )
+            player_options = []
+            tag_lookup = {}
+            for _, pr in latest_players.iterrows():
+                label = f"{pr['player_name']} ({pr['player_tag']}) · {pr['所属部落']} · {pr['大本']}本"
+                player_options.append(label)
+                tag_lookup[label] = pr["player_tag"]
 
-        if sel_player_label:
-            chosen_tag = tag_lookup[sel_player_label]
-            p_df = df_all_m[df_all_m["player_tag"] == chosen_tag].copy()
-
-            if mode_filter == "仅常规战":
-                p_df = p_df[p_df["赛事类型"] == "常规战"]
-            elif mode_filter == "仅七天联赛":
-                p_df = p_df[p_df["赛事类型"].str.startswith("七天联赛")]
-
-            p_df = p_df.sort_values("sort_key", ascending=False)
-
-            if p_df.empty:
-                st.warning("该成员在所选赛事类型下暂无记录。")
-            else:
-                max_rec = len(p_df)
-                if max_rec > 1:
-                    recent_k = st.slider(
-                        "查看最近场次数量",
-                        min_value=1,
-                        max_value=max_rec,
-                        value=min(15, max_rec),
-                        key="member_recent_k_slider",
-                    )
+            with f_col2:
+                if not player_options:
+                    st.warning("当前筛选部落下暂无成员记录。")
+                    sel_player_label = None
                 else:
-                    recent_k = 1
+                    sel_player_label = st.selectbox(
+                        "2. 选择成员（可直接输入名字搜索）",
+                        options=player_options,
+                        key="member_player_select",
+                    )
 
-                p_recent = p_df.head(recent_k).copy()
-
-                # 核心指标卡片
-                total_matches = len(p_recent)
-                total_used = int(p_recent["已出刀"].sum())
-                total_limit = int(p_recent["应出刀"].sum())
-                total_missed = int(p_recent["漏刀"].sum())
-                total_stars = int(p_recent["得星"].sum())
-                total_3s = int(p_recent["三星数"].sum())
-                avg_stars = round(total_stars / total_used, 2) if total_used > 0 else 0.0
-                rate_3s = round(total_3s / total_used * 100, 1) if total_used > 0 else 0.0
-                avg_dest = round(p_recent[p_recent["已出刀"] > 0]["平均摧毁(%)"].mean(), 1) if total_used > 0 else 0.0
-
-                k1, k2, k3, k4, k5 = st.columns(5)
-                k1.metric("近期参战", f"{total_matches} 场")
-                k2.metric(
-                    "出刀 / 漏刀",
-                    f"{total_used} / {total_limit} 刀",
-                    delta=f"漏 {total_missed} 刀" if total_missed > 0 else "全勤零漏刀",
-                    delta_color="inverse" if total_missed > 0 else "normal",
+            with f_col3:
+                mode_filter = st.selectbox(
+                    "3. 赛事范围",
+                    options=["全部战绩 (常规+联赛)", "仅常规战", "仅七天联赛"],
+                    key="member_mode_filter",
                 )
-                k3.metric("累计得星", f"{total_stars} ★", delta=f"刀均 {avg_stars} ★")
-                k4.metric("三星次数", f"{total_3s} 次", delta=f"三星率 {rate_3s}%")
-                k5.metric("刀均摧毁率", f"{avg_dest}%")
 
-                # 近期逐场明细表
-                p_recent["漏刀标记"] = p_recent["漏刀"].apply(lambda x: f"❌ 漏{x}刀" if x > 0 else "✅ 满刀")
-                display_cols = [
-                    "日期/赛季",
-                    "赛事类型",
-                    "所属部落",
-                    "对手部落",
-                    "顺位",
-                    "大本",
-                    "出刀情况",
-                    "漏刀标记",
-                    "得星",
-                    "三星数",
-                    "总摧毁(%)",
-                    "状态",
-                ]
-                st.subheader(f"📋 {p_recent.iloc[0]['player_name']} 最近 {total_matches} 场战绩明细")
-                st.dataframe(p_recent[display_cols], use_container_width=True, hide_index=True)
+            if sel_player_label:
+                chosen_tag = tag_lookup[sel_player_label]
+                p_df = df_all_m[df_all_m["player_tag"] == chosen_tag].copy()
+
+                if mode_filter == "仅常规战":
+                    p_df = p_df[p_df["赛事类型"] == "常规战"]
+                elif mode_filter == "仅七天联赛":
+                    p_df = p_df[p_df["赛事类型"].str.startswith("七天联赛")]
+
+                p_df = p_df.sort_values("sort_key", ascending=False)
+
+                if p_df.empty:
+                    st.warning("该成员在所选赛事类型下暂无记录。")
+                else:
+                    max_rec = len(p_df)
+                    recent_k = (
+                        st.slider(
+                            "查看最近场次数量",
+                            min_value=1,
+                            max_value=max_rec,
+                            value=min(15, max_rec),
+                            key="member_recent_k_slider",
+                        )
+                        if max_rec > 1
+                        else 1
+                    )
+                    p_recent = p_df.head(recent_k).copy()
+
+                    total_matches = len(p_recent)
+                    total_used = int(p_recent["已出刀"].sum())
+                    total_limit = int(p_recent["应出刀"].sum())
+                    total_missed = int(p_recent["漏刀"].sum())
+                    total_stars = int(p_recent["得星"].sum())
+                    total_3s = int(p_recent["三星数"].sum())
+                    avg_stars = round(total_stars / total_used, 2) if total_used > 0 else 0.0
+                    rate_3s = round(total_3s / total_used * 100, 1) if total_used > 0 else 0.0
+                    avg_dest = round(p_recent[p_recent["已出刀"] > 0]["平均摧毁(%)"].mean(), 1) if total_used > 0 else 0.0
+
+                    k1, k2, k3, k4, k5 = st.columns(5)
+                    k1.metric("近期参战", f"{total_matches} 场")
+                    k2.metric(
+                        "出刀 / 漏刀",
+                        f"{total_used} / {total_limit} 刀",
+                        delta=f"漏 {total_missed} 刀" if total_missed > 0 else "全勤零漏刀",
+                        delta_color="inverse" if total_missed > 0 else "normal",
+                    )
+                    k3.metric("累计得星", f"{total_stars} ★", delta=f"刀均 {avg_stars} ★")
+                    k4.metric("三星次数", f"{total_3s} 次", delta=f"三星率 {rate_3s}%")
+                    k5.metric("刀均摧毁率", f"{avg_dest}%")
+
+                    p_recent["漏刀标记"] = p_recent["漏刀"].apply(lambda x: f"❌ 漏{x}刀" if x > 0 else "✅ 满刀")
+                    display_cols = [
+                        "日期/赛季",
+                        "赛事类型",
+                        "所属部落",
+                        "对手部落",
+                        "顺位",
+                        "大本",
+                        "出刀情况",
+                        "漏刀标记",
+                        "得星",
+                        "三星数",
+                        "总摧毁(%)",
+                        "状态",
+                    ]
+                    st.subheader(f"📋 {p_recent.iloc[0]['player_name']} 最近 {total_matches} 场战绩明细")
+                    st.dataframe(p_recent[display_cols], use_container_width=True, hide_index=True)
+
+    # ------------------------------------------
+    # 模式 B：输入任意 #玩家标签 跨部落搜索
+    # ------------------------------------------
+    else:
+        sc1, sc2 = st.columns([3, 1])
+        with sc1:
+            input_tag = st.text_input(
+                "输入玩家标签（支持不带 #，例如 P8QGLU980）",
+                placeholder="#XXXXXXXXX",
+                key="ext_player_tag_input",
+            )
+        with sc2:
+            st.write("")
+            st.write("")
+            do_search = st.button("🔍 立即查询", use_container_width=True)
+
+        if input_tag.strip() or do_search:
+            norm_t = normalize_tag(input_tag)
+            token_live = get_secret("COC_API_TOKEN")
+            res = fetch_external_player_live(norm_t, token_live)
+
+            if "error" in res:
+                st.error(res["error"])
+            else:
+                st.subheader(f"👤 {res['name']} ({res['tag']}) · {res['town_hall']}本 · 当前部落：{res['clan_name']}")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("当前所在部落", res["clan_name"], delta=res["clan_tag"] or "未加入部落")
+                m2.metric("生涯七天联赛总星", f"{res['cwl_legend_stars']} ★")
+                m3.metric("生涯常规战总星", f"{res['war_hero_stars']} ★")
+                m4.metric("当前参战意愿", res["war_pref"])
+
+                # 第三方历史档案快捷链接（用于查更早以前在外部部落的联赛）
+                bare_tag = res["tag"].lstrip("#")
+                st.caption(
+                    f"💡 COC 官方接口仅开放生涯总星与当前所在部落的实时对阵；如需翻查该账号更早以前在外部部落的历史联赛，可打开 "
+                    f"[Clash of Stats 历史战绩页](https://www.clashofstats.com/players/{bare_tag}/wars/cwl) 查看。"
+                )
+
+                if res["ext_cwl_note"]:
+                    st.info(res["ext_cwl_note"])
+                if res["ext_war_note"]:
+                    st.info(res["ext_war_note"])
+
+                # 展示该账号当前所在外部部落的本赛季七天联赛 & 常规战
+                live_ext_list = res["ext_cwl_rows"] + res["ext_war_rows"]
+                if live_ext_list:
+                    st.markdown("#### 🔥 当前所在部落实时战况（本赛季联赛 / 进行中常规战）")
+                    st.dataframe(pd.DataFrame(live_ext_list), use_container_width=True, hide_index=True)
+
+                # 如果他在我们自己的三个部落也有过历史存档，一并列出
+                if not df_all_m.empty:
+                    local_hist = df_all_m[df_all_m["player_tag"] == res["tag"]].sort_values("sort_key", ascending=False)
+                    if not local_hist.empty:
+                        local_hist = local_hist.copy()
+                        local_hist["漏刀标记"] = local_hist["漏刀"].apply(lambda x: f"❌ 漏{x}刀" if x > 0 else "✅ 满刀")
+                        disp_c = [
+                            "日期/赛季", "赛事类型", "所属部落", "对手部落", "顺位",
+                            "大本", "出刀情况", "漏刀标记", "得星", "三星数", "总摧毁(%)", "状态"
+                        ]
+                        st.markdown(f"#### 📂 在本群（萌面打劫 / 萌虎下山 / 小倔强）的历史归档（共 {len(local_hist)} 场）")
+                        st.dataframe(local_hist[disp_c], use_container_width=True, hide_index=True)
