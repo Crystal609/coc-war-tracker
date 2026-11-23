@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import urllib.parse
@@ -6,7 +5,6 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
-# 三个部落配置
 CLANS = [
     {"name": "萌面打劫", "tag": "#2YR9JVCG8"},
     {"name": "萌虎下山", "tag": "#2JLC9Q8LL"},
@@ -17,9 +15,7 @@ API_TOKEN = os.getenv("COC_API_TOKEN", "").strip()
 API_BASE = os.getenv("COC_API_BASE", "https://cocproxy.royaleapi.dev/v1").rstrip("/")
 WAR_HISTORY_FILE = "war_history.csv"
 CWL_HISTORY_FILE = "cwl_history.csv"
-
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SHEET_WEBHOOK_URL = os.getenv("GOOGLE_SHEET_WEBHOOK_URL", "").strip()
 
 WAR_COLUMNS = [
     "clan_tag",
@@ -83,9 +79,6 @@ def api_get(path: str, token: str) -> dict | None:
     return resp.json()
 
 
-# ==============================================================================
-# 1. 常规部落战抓拍
-# ==============================================================================
 def fetch_regular_war(clan_tag: str, default_name: str, token: str) -> pd.DataFrame:
     encoded_tag = urllib.parse.quote(clan_tag)
     data = api_get(f"/clans/{encoded_tag}/currentwar", token)
@@ -182,9 +175,6 @@ def update_war_csv(all_new_dfs: list, filepath: str = WAR_HISTORY_FILE) -> pd.Da
     return final_df
 
 
-# ==============================================================================
-# 2. 七天部落对战联赛 (CWL) 抓拍
-# ==============================================================================
 def fetch_cwl_season(clan_tag: str, default_name: str, token: str) -> pd.DataFrame:
     encoded_tag = urllib.parse.quote(clan_tag)
     group = api_get(f"/clans/{encoded_tag}/currentwar/leaguegroup", token)
@@ -297,9 +287,30 @@ def update_cwl_csv(all_cwl_dfs: list, filepath: str = CWL_HISTORY_FILE) -> pd.Da
     return final_df
 
 
-# ==============================================================================
-# 3. 后台自动备份到 Google Sheet
-# ==============================================================================
+def build_war_15_summary(war_df: pd.DataFrame) -> pd.DataFrame:
+    if war_df.empty:
+        return pd.DataFrame()
+    sum_list = []
+    for _, sub_c in war_df.groupby("clan_tag"):
+        wars = sorted(sub_c["war_id"].astype(str).unique().tolist())[-15:]
+        sub_15 = sub_c[sub_c["war_id"].astype(str).isin(wars)]
+        g = (
+            sub_15.groupby(["clan_name", "clan_tag", "player_tag", "player_name"], as_index=False)
+            .agg(
+                大本营=("town_hall", "max"),
+                参战场次=("war_id", "nunique"),
+                应出刀数=("attacks_per_member", "sum"),
+                实际出刀=("attacks_used", "sum"),
+                漏打刀数=("attacks_missed", "sum"),
+                总得星=("total_stars", "sum"),
+            )
+        )
+        g["漏刀率(%)"] = (g["漏打刀数"] / g["应出刀数"] * 100).round(1)
+        g = g.sort_values(by=["漏打刀数", "漏刀率(%)"], ascending=[False, False])
+        sum_list.append(g)
+    return pd.concat(sum_list, ignore_index=True) if sum_list else pd.DataFrame()
+
+
 def build_cwl_7day_summary(cwl_df: pd.DataFrame) -> pd.DataFrame:
     if cwl_df.empty:
         return pd.DataFrame()
@@ -354,67 +365,46 @@ def build_cwl_7day_summary(cwl_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def df_to_rows(df: pd.DataFrame) -> list:
+    if df.empty:
+        return []
+    clean_df = df.fillna("")
+    return [clean_df.columns.tolist()] + clean_df.astype(str).values.tolist()
+
+
 def sync_to_google_sheet(war_df: pd.DataFrame, cwl_df: pd.DataFrame) -> None:
-    if not GOOGLE_SA_JSON or not GOOGLE_SHEET_ID:
-        print("[Google Sheet 备份] 未配置密钥，跳过云端表格同步。")
+    if not GOOGLE_SHEET_WEBHOOK_URL:
+        print("[Google Sheet 备份] 未配置 GOOGLE_SHEET_WEBHOOK_URL，跳过云端同步。")
+        return
+
+    tabs_payload = {}
+    war_sum = build_war_15_summary(war_df)
+    cwl_sum = build_cwl_7day_summary(cwl_df)
+
+    if not cwl_sum.empty:
+        tabs_payload["七天联赛_汇总"] = df_to_rows(cwl_sum)
+    if not cwl_df.empty:
+        tabs_payload["七天联赛_每日明细"] = df_to_rows(cwl_df)
+    if not war_sum.empty:
+        tabs_payload["常规战_近15场汇总"] = df_to_rows(war_sum)
+    if not war_df.empty:
+        tabs_payload["常规战_原始明细"] = df_to_rows(war_df)
+
+    if not tabs_payload:
         return
 
     try:
-        import gspread
-        from google.oauth2.service_account import Credentials
-
-        creds_dict = json.loads(GOOGLE_SA_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
-
-        def write_tab(tab_name: str, df: pd.DataFrame):
-            if df.empty:
-                return
-            clean_df = df.fillna("")
-            try:
-                ws = sh.worksheet(tab_name)
-            except gspread.WorksheetNotFound:
-                ws = sh.add_worksheet(title=tab_name, rows=max(200, len(clean_df) + 20), cols=max(25, len(clean_df.columns) + 2))
-            ws.clear()
-            values = [clean_df.columns.tolist()] + clean_df.astype(str).values.tolist()
-            ws.update(range_name="A1", values=values)
-
-        if not war_df.empty:
-            sum_list = []
-            for c_tag, sub_c in war_df.groupby("clan_tag"):
-                wars = sorted(sub_c["war_id"].astype(str).unique().tolist())[-15:]
-                sub_15 = sub_c[sub_c["war_id"].astype(str).isin(wars)]
-                g = (
-                    sub_15.groupby(["clan_name", "clan_tag", "player_tag", "player_name"], as_index=False)
-                    .agg(
-                        大本营=("town_hall", "max"),
-                        参战场次=("war_id", "nunique"),
-                        应出刀数=("attacks_per_member", "sum"),
-                        实际出刀=("attacks_used", "sum"),
-                        漏打刀数=("attacks_missed", "sum"),
-                        总得星=("total_stars", "sum"),
-                    )
-                )
-                g["漏刀率(%)"] = (g["漏打刀数"] / g["应出刀数"] * 100).round(1)
-                g = g.sort_values(by=["漏打刀数", "漏刀率(%)"], ascending=[False, False])
-                sum_list.append(g)
-            if sum_list:
-                write_tab("常规战_近15场汇总", pd.concat(sum_list, ignore_index=True))
-            write_tab("常规战_原始明细", war_df)
-
-        if not cwl_df.empty:
-            cwl_sum = build_cwl_7day_summary(cwl_df)
-            write_tab("七天联赛_汇总", cwl_sum)
-            write_tab("七天联赛_每日明细", cwl_df)
-
-        print("[Google Sheet 备份] 已成功将常规战与七天联赛数据备份至 Google Sheet！")
+        resp = requests.post(
+            GOOGLE_SHEET_WEBHOOK_URL,
+            json={"tabs": tabs_payload},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            print(f"[Google Sheet 备份] 已成功写入云端表格：{resp.text[:100]}")
+        else:
+            print(f"[Google Sheet 备份警告] 返回异常 ({resp.status_code}): {resp.text}", file=sys.stderr)
     except Exception as exc:
-        print(f"[Google Sheet 备份警告] 同步失败（不影响 GitHub CSV 存档）: {exc}", file=sys.stderr)
+        print(f"[Google Sheet 备份警告] 请求失败（不影响 GitHub CSV 存档）: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
