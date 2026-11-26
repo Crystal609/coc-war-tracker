@@ -1,5 +1,6 @@
 import os
 import urllib.parse
+from datetime import datetime, timezone
 import pandas as pd
 import requests
 import streamlit as st
@@ -45,6 +46,36 @@ def normalize_tag(tag: str) -> str:
     if t and not t.startswith("#"):
         t = "#" + t
     return t
+
+
+def parse_coc_utc(val: str) -> datetime | None:
+    s = str(val or "").strip()
+    try:
+        if len(s) >= 15 and "T" in s:
+            return datetime.strptime(s[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        if len(s) >= 19 and s[4] == "-":
+            return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return None
+
+
+def classify_war_status(war_state: str, end_time_str: str) -> str:
+    """
+    区分三种状态：
+    - 'warEnded': 已抓到终局（漏刀 100% 准确）
+    - 'inWar': 确实还在战斗中
+    - 'unfinalized': 比赛已过结束时间，但最后抓拍停在结束前（未抓到终局，不可误判漏刀）
+    """
+    st_raw = str(war_state or "").strip()
+    if st_raw == "warEnded":
+        return "warEnded"
+    if st_raw == "inWar":
+        end_dt = parse_coc_utc(end_time_str)
+        if end_dt is not None and datetime.now(timezone.utc) > end_dt:
+            return "unfinalized"
+        return "inWar"
+    return st_raw
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -307,13 +338,13 @@ with tab_live:
                 st.dataframe(df_live_show, use_container_width=True, hide_index=True)
 
 # ==========================================
-# Tab 2: 常规战归档（默认只统计已结束场次，避免进行中比赛误算漏刀）
+# Tab 2: 常规战归档（仅 warEnded 计入漏刀；未抓到终局的快照不误判漏刀）
 # ==========================================
 with tab_war:
     if war_df.empty:
         st.info("暂无常规战归档记录，等待 GitHub Actions 自动抓拍后即可查看。")
     else:
-        col_w1, col_w2, col_w3 = st.columns([2, 2, 1.5])
+        col_w1, col_w2 = st.columns(2)
         with col_w1:
             clan_opts_w = ["全部部落"] + [f"{c['name']} ({c['tag']})" for c in CLANS]
             sel_w_clan = st.selectbox("筛选部落", clan_opts_w, key="war_arch_clan")
@@ -333,50 +364,42 @@ with tab_war:
                 index=2,
                 key="war_range_select",
             )
-        with col_w3:
-            st.write("")
-            st.write("")
-            include_ongoing = st.checkbox(
-                "包含进行中 (inWar) 场次",
-                value=False,
-                key="war_include_ongoing",
-            )
 
         sub_war = war_df.copy()
         if sel_w_clan != "全部部落":
             target_tag = sel_w_clan.split("(")[-1].rstrip(")")
             sub_war = sub_war[sub_war["clan_tag"].astype(str) == target_tag]
 
-        ended_cnt = int(sub_war[sub_war["war_state"].astype(str) == "warEnded"]["war_id"].astype(str).nunique())
-        ongoing_cnt = int(sub_war[sub_war["war_state"].astype(str) == "inWar"]["war_id"].astype(str).nunique())
-
-        if not include_ongoing and ended_cnt > 0:
-            sub_war = sub_war[sub_war["war_state"].astype(str) == "warEnded"]
+        sub_war["real_status"] = sub_war.apply(
+            lambda r: classify_war_status(r.get("war_state", ""), r.get("end_time", "")),
+            axis=1,
+        )
+        sub_war["confirmed_missed"] = sub_war.apply(
+            lambda r: safe_int(r.get("attacks_missed", 0)) if r["real_status"] == "warEnded" else 0,
+            axis=1,
+        )
+        sub_war["confirmed_expected"] = sub_war.apply(
+            lambda r: safe_int(r.get("attacks_per_member", 2), 2) if r["real_status"] == "warEnded" else safe_int(r.get("attacks_used", 0)),
+            axis=1,
+        )
 
         total_wars_cnt = int(sub_war["war_id"].astype(str).nunique())
+        unfinalized_cnt = int(sub_war[sub_war["real_status"] == "unfinalized"]["war_id"].astype(str).nunique())
         target_n = range_map[sel_range_label]
 
         if target_n is None:
             sub_war_recent = sub_war.copy()
-            title_text = (
-                f"全部已结束常规战考勤汇总（已结束 {ended_cnt} 场"
-                + (f"，另有 {ongoing_cnt} 场进行中" if ongoing_cnt > 0 and not include_ongoing else "")
-                + "）"
-            )
         else:
             kept_parts = []
             for _, grp_clan in sub_war.groupby("clan_tag"):
                 c_wars = sorted(grp_clan["war_id"].astype(str).unique().tolist())[-target_n:]
                 kept_parts.append(grp_clan[grp_clan["war_id"].astype(str).isin(c_wars)])
             sub_war_recent = pd.concat(kept_parts, ignore_index=True) if kept_parts else sub_war.copy()
-            if include_ongoing:
-                title_text = f"{sel_range_label}常规战考勤汇总（含进行中，共 {total_wars_cnt} 场）"
-            else:
-                title_text = (
-                    f"{sel_range_label}常规战考勤汇总（已结束 {ended_cnt} 场"
-                    + (f"，另有 {ongoing_cnt} 场进行中未计入漏刀" if ongoing_cnt > 0 else "")
-                    + "）"
-                )
+
+        if unfinalized_cnt > 0:
+            st.caption(
+                f"ℹ️ 提示：早期有 {unfinalized_cnt} 场对战在结束前数小时抓拍后未抓到终局快照（已自动免除漏刀判定，防止最后几小时压哨出刀被误算为漏刀）。"
+            )
 
         if not sub_war_recent.empty:
             summary_w = (
@@ -384,15 +407,19 @@ with tab_war:
                 .agg(
                     大本=("town_hall", "max"),
                     参战场次=("war_id", "nunique"),
-                    应出刀=("attacks_per_member", "sum"),
+                    已核算刀数=("confirmed_expected", "sum"),
                     实出刀=("attacks_used", "sum"),
-                    漏刀=("attacks_missed", "sum"),
+                    确认漏刀=("confirmed_missed", "sum"),
                     总星=("total_stars", "sum"),
                     三星数=("three_stars", "sum"),
                 )
             )
-            summary_w["漏刀率(%)"] = (summary_w["漏刀"] / summary_w["应出刀"].replace(0, 1) * 100).round(1)
-            summary_w = summary_w.sort_values(by=["漏刀", "漏刀率(%)", "总星"], ascending=[False, False, False])
+            summary_w["漏刀率(%)"] = (
+                summary_w["确认漏刀"] / summary_w["已核算刀数"].replace(0, 1) * 100
+            ).round(1)
+            summary_w = summary_w.sort_values(
+                by=["确认漏刀", "漏刀率(%)", "总星"], ascending=[False, False, False]
+            )
             summary_w = summary_w.rename(
                 columns={
                     "clan_name": "所属部落",
@@ -400,18 +427,19 @@ with tab_war:
                     "player_name": "成员名称",
                 }
             )
-            st.subheader(title_text)
+            st.subheader(f"{sel_range_label}常规战考勤汇总（当前共 {total_wars_cnt} 场）")
             st.dataframe(summary_w, use_container_width=True, hide_index=True)
 
             with st.expander("查看逐场原始出刀明细", expanded=False):
-                detail_w = war_df.copy()
-                if sel_w_clan != "全部部落":
-                    target_tag = sel_w_clan.split("(")[-1].rstrip(")")
-                    detail_w = detail_w[detail_w["clan_tag"].astype(str) == target_tag]
+                detail_w = sub_war_recent.copy()
                 detail_w["日期"] = detail_w["start_time"].apply(format_date_str)
-                detail_w["状态说明"] = detail_w["war_state"].map(
-                    {"warEnded": "已结束", "inWar": "进行中", "preparation": "准备日"}
-                ).fillna(detail_w["war_state"])
+                status_cn_map = {
+                    "warEnded": "✅ 已结束(终局)",
+                    "inWar": "🔥 进行中",
+                    "unfinalized": "⚠️ 未抓到终局(不计漏刀)",
+                    "preparation": "⏳ 准备日",
+                }
+                detail_w["抓拍状态"] = detail_w["real_status"].map(status_cn_map).fillna(detail_w["war_state"])
                 detail_w = detail_w.rename(
                     columns={
                         "clan_name": "所属部落",
@@ -421,7 +449,7 @@ with tab_war:
                         "player_tag": "玩家标签",
                         "town_hall": "大本",
                         "attacks_used": "实出刀",
-                        "attacks_missed": "漏刀",
+                        "confirmed_missed": "确认漏刀",
                         "total_stars": "得星",
                         "three_stars": "三星数",
                         "total_destruction": "总摧毁(%)",
@@ -430,7 +458,7 @@ with tab_war:
                 cols_show = [
                     "日期", "所属部落", "对手部落", "顺位",
                     "成员名称", "玩家标签", "大本", "实出刀",
-                    "漏刀", "得星", "三星数", "总摧毁(%)", "状态说明"
+                    "确认漏刀", "得星", "三星数", "总摧毁(%)", "抓拍状态"
                 ]
                 cols_show = [c for c in cols_show if c in detail_w.columns]
                 st.dataframe(
@@ -539,8 +567,13 @@ with tab_member:
             stars = safe_int(r.get("total_stars", 0))
             s3 = safe_int(r.get("three_stars", 0))
             dest = safe_float(r.get("total_destruction", 0.0))
-            st_raw = str(r.get("war_state", ""))
-            st_label = "进行中" if st_raw == "inWar" else ("已结束" if st_raw == "warEnded" else st_raw)
+            real_st = classify_war_status(r.get("war_state", ""), r.get("end_time", ""))
+            st_cn = {
+                "warEnded": "已结束",
+                "inWar": "进行中",
+                "unfinalized": "未抓到终局",
+                "preparation": "准备日",
+            }.get(real_st, real_st)
 
             all_records.append({
                 "sort_key": str(r.get("start_time", "")) or str(r.get("war_id", "")),
@@ -554,14 +587,14 @@ with tab_member:
                 "大本": safe_int(r.get("town_hall", 0)),
                 "顺位": f"#{safe_int(r.get('map_position', 0))}",
                 "已出刀": used,
-                "应出刀": limit,
+                "应出刀": limit if real_st == "warEnded" else used,
                 "出刀情况": f"{used} / {limit}",
-                "漏刀": missed if st_raw == "warEnded" else 0,
+                "漏刀": missed if real_st == "warEnded" else 0,
                 "得星": stars,
                 "三星数": s3,
                 "总摧毁(%)": round(dest, 1),
                 "平均摧毁(%)": round(dest / used, 1) if used > 0 else 0.0,
-                "状态": st_label,
+                "状态": st_cn,
             })
 
     if not cwl_df.empty:
@@ -588,7 +621,7 @@ with tab_member:
                 "大本": safe_int(r.get("town_hall", 0)),
                 "顺位": f"#{safe_int(r.get('map_position', 0))}",
                 "已出刀": used,
-                "应出刀": 1,
+                "应出刀": 1 if st_raw == "warEnded" else used,
                 "出刀情况": f"{used} / 1",
                 "漏刀": missed if st_raw == "warEnded" else 0,
                 "得星": stars,
@@ -696,6 +729,8 @@ with tab_member:
                     def fmt_miss(row):
                         if row["状态"] == "进行中":
                             return "⏳ 进行中"
+                        if row["状态"] == "未抓到终局":
+                            return "⚠️ 未抓到终局"
                         return f"❌ 漏{int(row['漏刀'])}刀" if int(row["漏刀"]) > 0 else "✅ 满刀"
 
                     p_recent["漏刀标记"] = p_recent.apply(fmt_miss, axis=1)
@@ -759,7 +794,11 @@ with tab_member:
                     if not local_hist.empty:
                         local_hist = local_hist.copy()
                         local_hist["漏刀标记"] = local_hist.apply(
-                            lambda r: "⏳ 进行中" if r["状态"] == "进行中" else (f"❌ 漏{int(r['漏刀'])}刀" if int(r["漏刀"]) > 0 else "✅ 满刀"),
+                            lambda r: (
+                                "⏳ 进行中" if r["状态"] == "进行中"
+                                else ("⚠️ 未抓到终局" if r["状态"] == "未抓到终局"
+                                      else (f"❌ 漏{int(r['漏刀'])}刀" if int(r["漏刀"]) > 0 else "✅ 满刀"))
+                            ),
                             axis=1,
                         )
                         disp_c = [
