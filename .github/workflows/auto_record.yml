@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: coc-war-sync
+  cancel-in-progress: false
+
 jobs:
   record-war:
     runs-on: ubuntu-latest
