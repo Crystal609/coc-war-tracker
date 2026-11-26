@@ -1,7 +1,8 @@
 import os
 import sys
+import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import requests
 
@@ -407,7 +408,40 @@ def sync_to_google_sheet(war_df: pd.DataFrame, cwl_df: pd.DataFrame) -> None:
         print(f"[Google Sheet 备份警告] 请求失败（不影响 GitHub CSV 存档）: {exc}", file=sys.stderr)
 
 
-if __name__ == "__main__":
+def parse_end_time_utc(end_time_str: str) -> datetime | None:
+    s = str(end_time_str or "").strip()
+    try:
+        if len(s) >= 15 and "T" in s:
+            return datetime.strptime(s[:15], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return None
+
+
+def find_imminent_war_end(war_list: list, window_sec: int = 900) -> tuple[str, datetime] | None:
+    """检查三个部落中是否有处于战斗日(inWar)且距离结束 <= 15分钟的对局"""
+    now_utc = datetime.now(timezone.utc)
+    earliest_target = None
+
+    for df_w in war_list:
+        if df_w is None or df_w.empty:
+            continue
+        state = str(df_w["war_state"].iloc[0]).strip()
+        if state != "inWar":
+            continue
+        end_dt = parse_end_time_utc(df_w["end_time"].iloc[0])
+        if end_dt is None:
+            continue
+        rem = (end_dt - now_utc).total_seconds()
+        if 0 < rem <= window_sec:
+            c_name = str(df_w["clan_name"].iloc[0])
+            if earliest_target is None or end_dt < earliest_target[1]:
+                earliest_target = (c_name, end_dt)
+
+    return earliest_target
+
+
+def run_sync_once() -> tuple[list, list, bool]:
     war_list = []
     cwl_list = []
     has_error = False
@@ -438,6 +472,34 @@ if __name__ == "__main__":
     full_war_df = update_war_csv(war_list, WAR_HISTORY_FILE)
     full_cwl_df = update_cwl_csv(cwl_list, CWL_HISTORY_FILE)
     sync_to_google_sheet(full_war_df, full_cwl_df)
+
+    return war_list, cwl_list, has_error
+
+
+if __name__ == "__main__":
+    start_run_utc = datetime.now(timezone.utc)
+    war_list, cwl_list, has_error = run_sync_once()
+
+    # 赛末最后 15 分钟原地蹲点模式：防止副队秒开下一场导致漏抓压哨出刀
+    while True:
+        # 安全上限：单次运行最多蹲点 25 分钟，避免进程超时
+        if (datetime.now(timezone.utc) - start_run_utc).total_seconds() > 1500:
+            break
+
+        imminent = find_imminent_war_end(war_list, window_sec=900)
+        if imminent is None:
+            break
+
+        target_clan, end_dt = imminent
+        # 依次在 结束前60秒 -> 结束前15秒 -> 结束后15秒 精准抓拍
+        for offset_sec in (60, 15, -15):
+            checkpoint_dt = end_dt - timedelta(seconds=offset_sec)
+            sleep_sec = (checkpoint_dt - datetime.now(timezone.utc)).total_seconds()
+            if sleep_sec > 0:
+                label = f"结束前{offset_sec}秒" if offset_sec > 0 else f"结束后{abs(offset_sec)}秒"
+                print(f"⏳ [赛末蹲点 | {target_clan}] 等待 {sleep_sec:.1f} 秒，将于{label}精准抓拍...")
+                time.sleep(sleep_sec)
+                war_list, cwl_list, has_error = run_sync_once()
 
     if has_error and not war_list and not cwl_list:
         sys.exit(1)
