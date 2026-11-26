@@ -60,22 +60,21 @@ def parse_coc_utc(val: str) -> datetime | None:
     return None
 
 
-def classify_war_status(war_state: str, end_time_str: str) -> str:
+def is_war_finished(war_state: str, end_time_str: str) -> bool:
     """
-    区分三种状态：
-    - 'warEnded': 已抓到终局（漏刀 100% 准确）
-    - 'inWar': 确实还在战斗中
-    - 'unfinalized': 比赛已过结束时间，但最后抓拍停在结束前（未抓到终局，不可误判漏刀）
+    判断对战是否已真正结束：
+    - 官方标记为 warEnded -> 已结束
+    - 虽然抓拍时还是 inWar，但当前时间已超过 end_time -> 比赛实际已结束，必须正常计入漏刀
+    - 只有尚未到 end_time 的 inWar 或 preparation -> 正在进行中，暂不计入漏刀
     """
     st_raw = str(war_state or "").strip()
     if st_raw == "warEnded":
-        return "warEnded"
+        return True
     if st_raw == "inWar":
         end_dt = parse_coc_utc(end_time_str)
         if end_dt is not None and datetime.now(timezone.utc) > end_dt:
-            return "unfinalized"
-        return "inWar"
-    return st_raw
+            return True
+    return False
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -338,7 +337,7 @@ with tab_live:
                 st.dataframe(df_live_show, use_container_width=True, hide_index=True)
 
 # ==========================================
-# Tab 2: 常规战归档（仅 warEnded 计入漏刀；未抓到终局的快照不误判漏刀）
+# Tab 2: 常规战归档（已结束场次正常统计漏刀；未到结束时间的进行中比赛不提前算漏刀）
 # ==========================================
 with tab_war:
     if war_df.empty:
@@ -370,21 +369,22 @@ with tab_war:
             target_tag = sel_w_clan.split("(")[-1].rstrip(")")
             sub_war = sub_war[sub_war["clan_tag"].astype(str) == target_tag]
 
-        sub_war["real_status"] = sub_war.apply(
-            lambda r: classify_war_status(r.get("war_state", ""), r.get("end_time", "")),
+        sub_war["is_finished"] = sub_war.apply(
+            lambda r: is_war_finished(r.get("war_state", ""), r.get("end_time", "")),
             axis=1,
         )
-        sub_war["confirmed_missed"] = sub_war.apply(
-            lambda r: safe_int(r.get("attacks_missed", 0)) if r["real_status"] == "warEnded" else 0,
+        # 凡是已结束的场次（warEnded 或已超过 end_time）均正常计算漏刀；正在打的比赛暂不计漏刀
+        sub_war["calc_missed"] = sub_war.apply(
+            lambda r: safe_int(r.get("attacks_missed", 0)) if r["is_finished"] else 0,
             axis=1,
         )
-        sub_war["confirmed_expected"] = sub_war.apply(
-            lambda r: safe_int(r.get("attacks_per_member", 2), 2) if r["real_status"] == "warEnded" else safe_int(r.get("attacks_used", 0)),
+        sub_war["calc_expected"] = sub_war.apply(
+            lambda r: safe_int(r.get("attacks_per_member", 2), 2) if r["is_finished"] else safe_int(r.get("attacks_used", 0)),
             axis=1,
         )
 
         total_wars_cnt = int(sub_war["war_id"].astype(str).nunique())
-        unfinalized_cnt = int(sub_war[sub_war["real_status"] == "unfinalized"]["war_id"].astype(str).nunique())
+        live_ongoing_cnt = int(sub_war[~sub_war["is_finished"]]["war_id"].astype(str).nunique())
         target_n = range_map[sel_range_label]
 
         if target_n is None:
@@ -396,10 +396,8 @@ with tab_war:
                 kept_parts.append(grp_clan[grp_clan["war_id"].astype(str).isin(c_wars)])
             sub_war_recent = pd.concat(kept_parts, ignore_index=True) if kept_parts else sub_war.copy()
 
-        if unfinalized_cnt > 0:
-            st.caption(
-                f"ℹ️ 提示：早期有 {unfinalized_cnt} 场对战在结束前数小时抓拍后未抓到终局快照（已自动免除漏刀判定，防止最后几小时压哨出刀被误算为漏刀）。"
-            )
+        if live_ongoing_cnt > 0:
+            st.caption(f"🔥 当前有 {live_ongoing_cnt} 场部落战正在进行中（未到结束时间，暂不计入漏刀）。")
 
         if not sub_war_recent.empty:
             summary_w = (
@@ -407,18 +405,18 @@ with tab_war:
                 .agg(
                     大本=("town_hall", "max"),
                     参战场次=("war_id", "nunique"),
-                    已核算刀数=("confirmed_expected", "sum"),
+                    应出刀=("calc_expected", "sum"),
                     实出刀=("attacks_used", "sum"),
-                    确认漏刀=("confirmed_missed", "sum"),
+                    漏刀=("calc_missed", "sum"),
                     总星=("total_stars", "sum"),
                     三星数=("three_stars", "sum"),
                 )
             )
             summary_w["漏刀率(%)"] = (
-                summary_w["确认漏刀"] / summary_w["已核算刀数"].replace(0, 1) * 100
+                summary_w["漏刀"] / summary_w["应出刀"].replace(0, 1) * 100
             ).round(1)
             summary_w = summary_w.sort_values(
-                by=["确认漏刀", "漏刀率(%)", "总星"], ascending=[False, False, False]
+                by=["漏刀", "漏刀率(%)", "总星"], ascending=[False, False, False]
             )
             summary_w = summary_w.rename(
                 columns={
@@ -433,13 +431,10 @@ with tab_war:
             with st.expander("查看逐场原始出刀明细", expanded=False):
                 detail_w = sub_war_recent.copy()
                 detail_w["日期"] = detail_w["start_time"].apply(format_date_str)
-                status_cn_map = {
-                    "warEnded": "✅ 已结束(终局)",
-                    "inWar": "🔥 进行中",
-                    "unfinalized": "⚠️ 未抓到终局(不计漏刀)",
-                    "preparation": "⏳ 准备日",
-                }
-                detail_w["抓拍状态"] = detail_w["real_status"].map(status_cn_map).fillna(detail_w["war_state"])
+                detail_w["状态说明"] = detail_w.apply(
+                    lambda r: "已结束" if r["is_finished"] else ("准备日" if str(r.get("war_state", "")) == "preparation" else "进行中"),
+                    axis=1,
+                )
                 detail_w = detail_w.rename(
                     columns={
                         "clan_name": "所属部落",
@@ -449,7 +444,7 @@ with tab_war:
                         "player_tag": "玩家标签",
                         "town_hall": "大本",
                         "attacks_used": "实出刀",
-                        "confirmed_missed": "确认漏刀",
+                        "calc_missed": "漏刀",
                         "total_stars": "得星",
                         "three_stars": "三星数",
                         "total_destruction": "总摧毁(%)",
@@ -458,7 +453,7 @@ with tab_war:
                 cols_show = [
                     "日期", "所属部落", "对手部落", "顺位",
                     "成员名称", "玩家标签", "大本", "实出刀",
-                    "确认漏刀", "得星", "三星数", "总摧毁(%)", "抓拍状态"
+                    "漏刀", "得星", "三星数", "总摧毁(%)", "状态说明"
                 ]
                 cols_show = [c for c in cols_show if c in detail_w.columns]
                 st.dataframe(
@@ -567,13 +562,8 @@ with tab_member:
             stars = safe_int(r.get("total_stars", 0))
             s3 = safe_int(r.get("three_stars", 0))
             dest = safe_float(r.get("total_destruction", 0.0))
-            real_st = classify_war_status(r.get("war_state", ""), r.get("end_time", ""))
-            st_cn = {
-                "warEnded": "已结束",
-                "inWar": "进行中",
-                "unfinalized": "未抓到终局",
-                "preparation": "准备日",
-            }.get(real_st, real_st)
+            finished = is_war_finished(r.get("war_state", ""), r.get("end_time", ""))
+            st_cn = "已结束" if finished else ("准备日" if str(r.get("war_state", "")) == "preparation" else "进行中")
 
             all_records.append({
                 "sort_key": str(r.get("start_time", "")) or str(r.get("war_id", "")),
@@ -587,9 +577,9 @@ with tab_member:
                 "大本": safe_int(r.get("town_hall", 0)),
                 "顺位": f"#{safe_int(r.get('map_position', 0))}",
                 "已出刀": used,
-                "应出刀": limit if real_st == "warEnded" else used,
+                "应出刀": limit if finished else used,
                 "出刀情况": f"{used} / {limit}",
-                "漏刀": missed if real_st == "warEnded" else 0,
+                "漏刀": missed if finished else 0,
                 "得星": stars,
                 "三星数": s3,
                 "总摧毁(%)": round(dest, 1),
@@ -729,8 +719,6 @@ with tab_member:
                     def fmt_miss(row):
                         if row["状态"] == "进行中":
                             return "⏳ 进行中"
-                        if row["状态"] == "未抓到终局":
-                            return "⚠️ 未抓到终局"
                         return f"❌ 漏{int(row['漏刀'])}刀" if int(row["漏刀"]) > 0 else "✅ 满刀"
 
                     p_recent["漏刀标记"] = p_recent.apply(fmt_miss, axis=1)
@@ -796,8 +784,7 @@ with tab_member:
                         local_hist["漏刀标记"] = local_hist.apply(
                             lambda r: (
                                 "⏳ 进行中" if r["状态"] == "进行中"
-                                else ("⚠️ 未抓到终局" if r["状态"] == "未抓到终局"
-                                      else (f"❌ 漏{int(r['漏刀'])}刀" if int(r["漏刀"]) > 0 else "✅ 满刀"))
+                                else (f"❌ 漏{int(r['漏刀'])}刀" if int(r["漏刀"]) > 0 else "✅ 满刀")
                             ),
                             axis=1,
                         )
