@@ -145,7 +145,6 @@ def fetch_external_player_live(player_tag: str, token: str) -> dict:
 
     if cur_clan_tag:
         enc_c = urllib.parse.quote(cur_clan_tag)
-        # 1. 查该部落当前常规战
         w_code, w_data = api_get_cached(f"/clans/{enc_c}/currentwar", token)
         if w_code == 403:
             ext_war_note = f"该玩家当前所在部落 **{cur_clan_name}** 隐藏了对战日志，无法读取常规战明细。"
@@ -172,7 +171,6 @@ def fetch_external_player_live(player_tag: str, token: str) -> dict:
                         "状态": st_map.get(w_data.get("state", ""), ""),
                     })
 
-        # 2. 查该部落当前七天联赛
         g_code, g_data = api_get_cached(f"/clans/{enc_c}/currentwar/leaguegroup", token)
         if g_code == 403:
             ext_cwl_note = f"该玩家当前所在部落 **{cur_clan_name}** 隐藏了联赛日志。"
@@ -237,7 +235,6 @@ def fetch_external_player_live(player_tag: str, token: str) -> dict:
     }
 
 
-# 顶部简洁标题
 header_col1, header_col2 = st.columns([4, 1])
 with header_col1:
     st.title("⚔️ COC 部落战与联赛数据中心")
@@ -250,7 +247,6 @@ with header_col2:
 war_df = load_csv_safe(WAR_HISTORY_FILE)
 cwl_df = load_csv_safe(CWL_HISTORY_FILE)
 
-# 四个窗口：「👤 成员战绩查询」紧挨在「🏆 七天联赛」隔壁
 tab_live, tab_war, tab_cwl, tab_member = st.tabs(
     ["⚔️ 实时部落战", "📊 常规战归档", "🏆 七天联赛", "👤 成员战绩查询"]
 )
@@ -311,13 +307,13 @@ with tab_live:
                 st.dataframe(df_live_show, use_container_width=True, hide_index=True)
 
 # ==========================================
-# Tab 2: 常规战归档（优化：支持下拉选择统计多少场比赛）
+# Tab 2: 常规战归档（默认只统计已结束场次，避免进行中比赛误算漏刀）
 # ==========================================
 with tab_war:
     if war_df.empty:
         st.info("暂无常规战归档记录，等待 GitHub Actions 自动抓拍后即可查看。")
     else:
-        col_w1, col_w2 = st.columns(2)
+        col_w1, col_w2, col_w3 = st.columns([2, 2, 1.5])
         with col_w1:
             clan_opts_w = ["全部部落"] + [f"{c['name']} ({c['tag']})" for c in CLANS]
             sel_w_clan = st.selectbox("筛选部落", clan_opts_w, key="war_arch_clan")
@@ -334,8 +330,16 @@ with tab_war:
             sel_range_label = st.selectbox(
                 "统计场次范围",
                 options=list(range_map.keys()),
-                index=2,  # 默认选中「近 15 场」
+                index=2,
                 key="war_range_select",
+            )
+        with col_w3:
+            st.write("")
+            st.write("")
+            include_ongoing = st.checkbox(
+                "包含进行中 (inWar) 场次",
+                value=False,
+                key="war_include_ongoing",
             )
 
         sub_war = war_df.copy()
@@ -343,20 +347,36 @@ with tab_war:
             target_tag = sel_w_clan.split("(")[-1].rstrip(")")
             sub_war = sub_war[sub_war["clan_tag"].astype(str) == target_tag]
 
+        ended_cnt = int(sub_war[sub_war["war_state"].astype(str) == "warEnded"]["war_id"].astype(str).nunique())
+        ongoing_cnt = int(sub_war[sub_war["war_state"].astype(str) == "inWar"]["war_id"].astype(str).nunique())
+
+        if not include_ongoing and ended_cnt > 0:
+            sub_war = sub_war[sub_war["war_state"].astype(str) == "warEnded"]
+
         total_wars_cnt = int(sub_war["war_id"].astype(str).nunique())
         target_n = range_map[sel_range_label]
 
         if target_n is None:
             sub_war_recent = sub_war.copy()
-            title_text = f"全部已归档常规战考勤汇总（当前共 {total_wars_cnt} 场）"
+            title_text = (
+                f"全部已结束常规战考勤汇总（已结束 {ended_cnt} 场"
+                + (f"，另有 {ongoing_cnt} 场进行中" if ongoing_cnt > 0 and not include_ongoing else "")
+                + "）"
+            )
         else:
-            # 按每个部落各自取最近 target_n 场，全部部落合并时更公平
             kept_parts = []
             for _, grp_clan in sub_war.groupby("clan_tag"):
                 c_wars = sorted(grp_clan["war_id"].astype(str).unique().tolist())[-target_n:]
                 kept_parts.append(grp_clan[grp_clan["war_id"].astype(str).isin(c_wars)])
             sub_war_recent = pd.concat(kept_parts, ignore_index=True) if kept_parts else sub_war.copy()
-            title_text = f"{sel_range_label}常规战考勤汇总（当前已归档 {total_wars_cnt} 场）"
+            if include_ongoing:
+                title_text = f"{sel_range_label}常规战考勤汇总（含进行中，共 {total_wars_cnt} 场）"
+            else:
+                title_text = (
+                    f"{sel_range_label}常规战考勤汇总（已结束 {ended_cnt} 场"
+                    + (f"，另有 {ongoing_cnt} 场进行中未计入漏刀" if ongoing_cnt > 0 else "")
+                    + "）"
+                )
 
         if not sub_war_recent.empty:
             summary_w = (
@@ -384,8 +404,14 @@ with tab_war:
             st.dataframe(summary_w, use_container_width=True, hide_index=True)
 
             with st.expander("查看逐场原始出刀明细", expanded=False):
-                detail_w = sub_war_recent.copy()
+                detail_w = war_df.copy()
+                if sel_w_clan != "全部部落":
+                    target_tag = sel_w_clan.split("(")[-1].rstrip(")")
+                    detail_w = detail_w[detail_w["clan_tag"].astype(str) == target_tag]
                 detail_w["日期"] = detail_w["start_time"].apply(format_date_str)
+                detail_w["状态说明"] = detail_w["war_state"].map(
+                    {"warEnded": "已结束", "inWar": "进行中", "preparation": "准备日"}
+                ).fillna(detail_w["war_state"])
                 detail_w = detail_w.rename(
                     columns={
                         "clan_name": "所属部落",
@@ -399,13 +425,12 @@ with tab_war:
                         "total_stars": "得星",
                         "three_stars": "三星数",
                         "total_destruction": "总摧毁(%)",
-                        "war_state": "状态",
                     }
                 )
                 cols_show = [
                     "日期", "所属部落", "对手部落", "顺位",
                     "成员名称", "玩家标签", "大本", "实出刀",
-                    "漏刀", "得星", "三星数", "总摧毁(%)", "状态"
+                    "漏刀", "得星", "三星数", "总摧毁(%)", "状态说明"
                 ]
                 cols_show = [c for c in cols_show if c in detail_w.columns]
                 st.dataframe(
@@ -531,7 +556,7 @@ with tab_member:
                 "已出刀": used,
                 "应出刀": limit,
                 "出刀情况": f"{used} / {limit}",
-                "漏刀": missed,
+                "漏刀": missed if st_raw == "warEnded" else 0,
                 "得星": stars,
                 "三星数": s3,
                 "总摧毁(%)": round(dest, 1),
@@ -565,7 +590,7 @@ with tab_member:
                 "已出刀": used,
                 "应出刀": 1,
                 "出刀情况": f"{used} / 1",
-                "漏刀": missed,
+                "漏刀": missed if st_raw == "warEnded" else 0,
                 "得星": stars,
                 "三星数": s3,
                 "总摧毁(%)": round(dest, 1),
@@ -575,9 +600,6 @@ with tab_member:
 
     df_all_m = pd.DataFrame(all_records) if all_records else pd.DataFrame()
 
-    # ------------------------------------------
-    # 模式 A：从归档成员列表选择
-    # ------------------------------------------
     if search_mode.startswith("📋"):
         if df_all_m.empty:
             st.info("暂无成员战绩数据，等首次抓拍写入后即可在此查询任意成员的近期表现。")
@@ -671,7 +693,12 @@ with tab_member:
                     k4.metric("三星次数", f"{total_3s} 次", delta=f"三星率 {rate_3s}%")
                     k5.metric("刀均摧毁率", f"{avg_dest}%")
 
-                    p_recent["漏刀标记"] = p_recent["漏刀"].apply(lambda x: f"❌ 漏{x}刀" if x > 0 else "✅ 满刀")
+                    def fmt_miss(row):
+                        if row["状态"] == "进行中":
+                            return "⏳ 进行中"
+                        return f"❌ 漏{int(row['漏刀'])}刀" if int(row["漏刀"]) > 0 else "✅ 满刀"
+
+                    p_recent["漏刀标记"] = p_recent.apply(fmt_miss, axis=1)
                     display_cols = [
                         "日期/赛季",
                         "赛事类型",
@@ -689,9 +716,6 @@ with tab_member:
                     st.subheader(f"📋 {p_recent.iloc[0]['player_name']} 最近 {total_matches} 场战绩明细")
                     st.dataframe(p_recent[display_cols], use_container_width=True, hide_index=True)
 
-    # ------------------------------------------
-    # 模式 B：输入任意 #玩家标签 跨部落搜索
-    # ------------------------------------------
     else:
         sc1, sc2 = st.columns([3, 1])
         with sc1:
@@ -734,7 +758,10 @@ with tab_member:
                     local_hist = df_all_m[df_all_m["player_tag"] == res["tag"]].sort_values("sort_key", ascending=False)
                     if not local_hist.empty:
                         local_hist = local_hist.copy()
-                        local_hist["漏刀标记"] = local_hist["漏刀"].apply(lambda x: f"❌ 漏{x}刀" if x > 0 else "✅ 满刀")
+                        local_hist["漏刀标记"] = local_hist.apply(
+                            lambda r: "⏳ 进行中" if r["状态"] == "进行中" else (f"❌ 漏{int(r['漏刀'])}刀" if int(r["漏刀"]) > 0 else "✅ 满刀"),
+                            axis=1,
+                        )
                         disp_c = [
                             "日期/赛季", "赛事类型", "所属部落", "对手部落", "顺位",
                             "大本", "出刀情况", "漏刀标记", "得星", "三星数", "总摧毁(%)", "状态"
